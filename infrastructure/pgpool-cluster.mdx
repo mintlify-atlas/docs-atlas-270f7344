@@ -1,0 +1,144 @@
+---
+title: "Pgpool-II Replica Cluster: Setup and Architecture"
+sidebarTitle: "Pgpool Cluster"
+description: "How the bundled Pgpool-II Docker image runs 1 primary + 2 streaming replicas behind a single :5432 endpoint, and why it matters for write durability testing."
+---
+
+The `docker/pgpool/docker-compose.yaml` starts a complete PostgreSQL 16 streaming-replication cluster — one primary node and two asynchronous replicas — all behind a Pgpool-II load balancer. The entire topology runs inside the single `tripolskypetr/pgpool:latest` container, making it practical to run a production-representative database setup on a development laptop without any external orchestration. The application connects to `:5432` as if it were a plain Postgres endpoint; Pgpool transparently routes writes to the primary and distributes reads across the replicas.
+
+---
+
+## Why Run a Cluster in Development?
+
+On a **single-node** PostgreSQL instance, a write immediately followed by a `SELECT` appears perfectly atomic. Both operations reach the same OS process, the same shared-memory buffer pool, and the same WAL writer. Code that relies on this behaviour passes every test you throw at it.
+
+On a **replica cluster**, writes go to the primary but reads can be served by a replica that has not yet received the corresponding WAL segment. The window can be milliseconds, but it is real. Code that blindly reads back what it just wrote — without using the same connection or a `synchronous_commit` guarantee — can silently see stale data. In production, this manifests as duplicate rows, missed updates, or corrupted trading state that is nearly impossible to reproduce locally.
+
+Running the Pgpool cluster in development **surfaces these bugs early**, before they reach production. If your service logic works correctly against the cluster, it will be safe on any streaming-replication setup.
+
+---
+
+## Architecture
+
+```
+                    ┌──────────────────────────────┐
+  Application  ───▶ │  Pgpool-II  :5432            │
+                    │  (connection pooling +        │
+                    │   load balancing)             │
+                    └───────┬──────────┬────────────┘
+                            │          │
+                    Writes  │          │  Reads (round-robin)
+                            ▼          ▼
+                    ┌──────────┐  ┌──────────┐  ┌──────────┐
+                    │ primary  │  │replica-1 │  │replica-2 │
+                    │(R/W)     │  │(R only)  │  │(R only)  │
+                    └────┬─────┘  └────▲─────┘  └────▲─────┘
+                         │  WAL stream │               │
+                         └─────────────┴───────────────┘
+```
+
+| Layer | Role |
+|---|---|
+| **Pgpool-II :5432** | Single connection endpoint for the application. Parses queries and routes them — writes to the primary, reads to replicas. |
+| **postgres-primary** | Accepts all write transactions. Streams WAL to both replicas in real time. |
+| **replica-1 / replica-2** | Hot standbys. Accept read-only queries. Receive WAL from the primary asynchronously. |
+
+---
+
+## Starting the Cluster
+
+<Steps>
+  <Step title="Launch the container">
+    ```bash
+    docker-compose -f docker/pgpool/docker-compose.yaml up -d
+    ```
+    On first boot, the entrypoint script initialises the primary, then uses `pg_basebackup` to clone each replica. This takes approximately **60–90 seconds**.
+  </Step>
+  <Step title="Monitor startup progress">
+    ```bash
+    docker-compose -f docker/pgpool/docker-compose.yaml logs -f
+    ```
+    Look for the replica clone steps and the Pgpool-II startup sequence. The logs end with Pgpool accepting connections on `:5432`.
+  </Step>
+  <Step title="Wait for healthy status">
+    ```bash
+    docker-compose -f docker/pgpool/docker-compose.yaml ps
+    ```
+    The container status should transition from `starting` to `healthy`. The healthcheck is configured with `start_period: 120s` and up to **15 retries** at 10-second intervals, so the cluster has up to 150 seconds beyond the start period to become ready.
+  </Step>
+</Steps>
+
+---
+
+## Checking Readiness
+
+The healthcheck command embedded in the compose file probes the Pgpool endpoint directly:
+
+```bash
+PGPASSWORD=mysecurepassword psql \
+  -h 127.0.0.1 \
+  -p 5432 \
+  -U backtest \
+  -d backtest-pro \
+  -tAc 'SELECT 1'
+```
+
+You can run the same command from your host to verify the cluster is accepting connections:
+
+```bash
+PGPASSWORD=mysecurepassword psql \
+  -h 127.0.0.1 \
+  -p 5432 \
+  -U backtest \
+  -d backtest-pro \
+  -tAc 'SELECT 1'
+# Expected output: 1
+```
+
+---
+
+## Persistent Data
+
+Cluster data (primary WAL, replica data directories, Pgpool state) is bind-mounted from inside the container to `docker/pgpool/data/` on your host. This directory is gitignored, so it will not accidentally end up in version control.
+
+Because the data persists on disk, subsequent `docker-compose up` invocations start in seconds — the replica clone only runs on first boot when `docker/pgpool/data/` is empty.
+
+**To reset the cluster to a clean state:**
+
+```bash
+docker-compose -f docker/pgpool/docker-compose.yaml down
+rm -rf docker/pgpool/data/
+docker-compose -f docker/pgpool/docker-compose.yaml up -d
+```
+
+<Warning>
+  Deleting `docker/pgpool/data/` is irreversible. All tables, rows, and migrations stored in the dev database will be lost. Only do this when you want a completely fresh environment.
+</Warning>
+
+---
+
+## Single-Node Alternative
+
+For CI pipelines or experiments that do not involve replication-lag safety, `docker/postgres/docker-compose.yaml` runs a plain `postgres:16-alpine` node on the same port:
+
+```bash
+docker-compose -f docker/postgres/docker-compose.yaml up -d
+```
+
+<Warning>
+  The single-node setup hides replication-lag bugs. Application code that reads immediately after a write will always succeed against a single node, masking issues that will appear in production. Use the Pgpool cluster for any development work that touches the persistence layer.
+</Warning>
+
+---
+
+## Connection String
+
+<Note>
+  The application always connects through the single Pgpool-II endpoint at `:5432`. It does not need to know which node is currently primary, and it does not need to manage separate read/write connection pools. Pgpool handles query routing transparently.
+
+  ```
+  CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@localhost:5432/backtest-pro
+  ```
+
+  When the app runs inside Docker, replace `localhost` with `host.docker.internal` (see the `.env.example` file).
+</Note>

@@ -1,0 +1,121 @@
+---
+title: "Atomic Upserts: ON CONFLICT DO UPDATE RETURNING"
+sidebarTitle: "Atomicity"
+description: "How single-statement INSERT … ON CONFLICT … DO UPDATE … RETURNING eliminates read-then-write race conditions and replica-lag violations in the backtest-kit persistence layer."
+---
+
+backtest-kit's write durability contract is strict: after `writeXData(...)` returns, the very next `readXData(...)` must see the just-written value. The default file-based persistence satisfies this trivially — `fs.writeFile` followed by `fs.readFile` on the same node is effectively serialized. A naïve SQL implementation that does a `SELECT` to check existence, then either `INSERT` or `UPDATE`, does **not** satisfy this contract under concurrent access or on a replica cluster with asynchronous streaming replication.
+
+## The race condition
+
+Consider two parallel backtest workers processing the same `(symbol, strategyName, exchangeName)` context. Both call `findByContext` at the same time, both see no existing row, and both proceed to `INSERT`. The second insert crashes with a unique-constraint violation. The framework may retry indefinitely, silently corrupt state, or stall the backtest engine.
+
+Even without concurrency the problem exists on a read-replica cluster. The write goes to the primary. The follow-up `SELECT` can be routed to an async replica that has not yet received the commit. The read returns a stale value — or `null` — even though the write already committed. Code that passes every test on a single Postgres node silently breaks in production, because a lone node serializes everything through one process and hides the gap.
+
+## The atomic solution
+
+Every `upsert` in this project is a **single atomic round-trip** — one `INSERT … ON CONFLICT … DO UPDATE … RETURNING *` statement that does not require a preceding `SELECT`. The TypeORM query-builder maps cleanly onto this SQL pattern:
+
+```typescript
+// src/lib/services/db/SignalDbService.ts
+public upsert = async (symbol, strategyName, exchangeName, payload) => {
+  const repo = await this.repo<ISignalRowDoc>();
+  const { raw } = await repo
+    .createQueryBuilder()
+    .insert()
+    .values({ symbol, strategyName, exchangeName, payload })
+    .orUpdate(["payload"], ["symbol", "strategyName", "exchangeName"])  // conflict target = unique index
+    .returning("*")
+    .execute();
+  const result = raw[0] as ISignalRowDoc;
+  await this.signalCacheService.setSignalId(result);   // Redis seeded from RETURNING row
+};
+```
+
+PostgreSQL receives a single statement. There is no read-then-write window. The conflict target — `(symbol, strategyName, exchangeName)` — matches the unique index declared on the table. When two concurrent inserts race, PostgreSQL serializes them at the storage level: the loser takes the `DO UPDATE` branch without throwing, and both callers receive a valid row from `RETURNING`.
+
+## Four key properties
+
+<Steps>
+  <Step title="Conflict target == unique index shape">
+    Every table declares a compound unique index whose columns are exactly the context-key fields (e.g. `signal_items_uq` on `(symbol, strategyName, exchangeName)`). PostgreSQL acquires a row-level lock on the conflicting key at the storage engine level before deciding which branch to take. The losing concurrent insert updates the row rather than throwing a constraint violation — the unique-violation never leaks to the application layer.
+  </Step>
+  <Step title="DO UPDATE SET payload = EXCLUDED.payload — a real update">
+    The conflict branch is a genuine write: `payload` is replaced with the value from the incoming `EXCLUDED` pseudo-row. This means subsequent calls to `writeSignalData` with a new payload are real updates, not no-ops. The exception is `CandleDbService`, where OHLCV data is immutable once written (see the Candle insert-only pattern below).
+  </Step>
+  <Step title="RETURNING * — the written row, in the same statement">
+    `RETURNING *` yields the just-written or just-updated row as part of the same statement result. Its `id` (a `gen_random_uuid()` UUID) is used to seed the Redis cache immediately, in the same critical section as the write. The Redis cache is **never** seeded from a follow-up `SELECT`, which could be routed to a lagging replica.
+  </Step>
+  <Step title="UUID PKs with gen_random_uuid()">
+    TypeORM generates `uuid` primary keys server-side via `gen_random_uuid()`. There is no application-side ID bookkeeping, no sequence contention, and no risk of ID collision when multiple application instances write simultaneously.
+  </Step>
+</Steps>
+
+## Candle insert-only pattern
+
+Candles are immutable: once an OHLCV row is stored for a given `(symbol, interval, timestamp)`, it must never be overwritten. However, `ON CONFLICT DO NOTHING` cannot return the conflicting row via `RETURNING` without a follow-up `SELECT` — which may hit a lagging replica and break the read-after-write guarantee.
+
+The solution is a **no-op `DO UPDATE`** that rewrites the natural key column to its own `EXCLUDED` value. The OHLCV columns are never touched, but the row is always returned by `RETURNING` whether it was freshly inserted or already existed:
+
+```typescript
+// src/lib/services/db/CandleDbService.ts
+const { raw } = await repo
+  .createQueryBuilder()
+  .insert()
+  .values({
+    symbol: dto.symbol,
+    interval: dto.interval,
+    timestamp: dto.timestamp,
+    exchangeName: EXCHANGE_NAME,
+    open: dto.open, high: dto.high, low: dto.low, close: dto.close, volume: dto.volume,
+  })
+  .orUpdate(["symbol"], ["symbol", "interval", "timestamp"])   // no-op: symbol = EXCLUDED.symbol
+  .returning("*")
+  .execute();
+const result = raw[0] as ICandleRow;
+await this.candleCacheService.setCandleId(result);             // always seeded, never from SELECT
+```
+
+The no-op update (`symbol = EXCLUDED.symbol`) satisfies PostgreSQL's requirement that `DO UPDATE` sets at least one column, while ensuring OHLCV values are never mutated after their first write.
+
+## Soft-delete atomic pattern
+
+For Measure, Interval, and Memory, rows are never physically deleted. Instead, `softRemove` flips a `removed: boolean` flag and sets the nested `payload.removed` field in a single server-side `UPDATE` using `jsonb_set`. There is no `SELECT`-then-save window where a concurrent upsert could be lost:
+
+```typescript
+// src/lib/services/db/IntervalDbService.ts
+public softRemove = async (bucket: string, entryKey: string): Promise<void> => {
+  const repo = await this.repo<IIntervalRow>();
+  const { raw } = await repo
+    .createQueryBuilder()
+    .update()
+    .set({
+      removed: true,
+      payload: () => `jsonb_set("payload", '{removed}', 'true')`,  // server-side jsonb mutation
+    })
+    .where({ bucket, entryKey })
+    .returning("*")
+    .execute();
+  const saved = raw[0] as IIntervalRow | undefined;
+  if (!saved) return;                                               // early-return if row not found
+  await this.intervalCacheService.setIntervalId(saved);            // cache reflects tombstone
+};
+```
+
+Because the new value is computed on the server (`jsonb_set`) inside a single statement, there is no read-modify-write window where a concurrent upsert could be lost. `listKeys` and `listEntries` filter on `removed = false` to skip tombstones.
+
+## The single-node atomicity illusion
+
+<Warning>
+  A lone PostgreSQL instance is **one process**: all concurrency is arbitrated internally by row locks and MVCC, which creates an effective global mutex for a given row. On a single node, even a sloppy `write` followed by a separate `SELECT` appears correct because that `SELECT` hits the very same process that just committed. It *looks* atomic.
+
+  Add read replicas and the illusion breaks. Writes go to the primary, but reads can be load-balanced onto asynchronous replicas that lag behind by milliseconds. A `write` followed by a separate `SELECT` can be routed to a replica that has not yet received the commit, silently returning a stale or null value — a violation of the read-after-write contract that passes every test on a single-node dev database and corrupts state in production.
+
+  This is exactly why the dev environment (`docker/pgpool`) runs a **real cluster with two streaming replicas** behind Pgpool-II rather than a single Postgres container. Any accidental read-after-write dependency surfaces in development, not in prod.
+</Warning>
+
+## RETURNING vs follow-up SELECT
+
+<Note>
+  The Redis cache is **always** seeded from the row returned by `RETURNING *` in the same write statement — never from a follow-up `SELECT`. This matters on a replica cluster: a subsequent `SELECT` may be routed to a replica that has not yet applied the write. By seeding Redis from the primary's `RETURNING` row, the next `findByContext` call gets a cache hit that resolves via a Postgres primary-key lookup, bypassing replica routing entirely.
+</Note>

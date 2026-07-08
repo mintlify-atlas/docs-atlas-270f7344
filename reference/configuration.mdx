@@ -1,0 +1,258 @@
+---
+title: "Full Configuration Reference: Env Vars and Build Settings"
+sidebarTitle: "Configuration"
+description: "Complete reference for all environment variables, build scripts, TypeScript configuration, and Rollup bundler settings for backtest-kit-redis-postgres-pgpool-docker."
+---
+
+The project reads all runtime configuration from environment variables, applying sensible defaults for local development. A `.env` file at the project root (copied from `.env.example`) is the recommended way to supply values for Docker-hosted services. No source files need to be modified for a standard local or Docker-Compose workflow — only the `.env` file needs to change between environments.
+
+---
+
+## Application Environment Variables
+
+These variables are read at startup by `src/config/params.ts` and control how the application connects to PostgreSQL and Redis.
+
+```typescript
+// src/config/params.ts
+export const CC_REDIS_HOST     = process.env.CC_REDIS_HOST     || "127.0.0.1";
+export const CC_REDIS_PORT     = parseInt(process.env.CC_REDIS_PORT) || 6379;
+export const CC_REDIS_USER     = process.env.CC_REDIS_USER     || "default";
+export const CC_REDIS_PASSWORD = process.env.CC_REDIS_PASSWORD || "mysecurepassword";
+
+export const CC_POSTGRES_CONNECTION_STRING =
+  process.env.CC_POSTGRES_CONNECTION_STRING ||
+  "postgres://backtest:mysecurepassword@localhost:5432/backtest-pro";
+```
+
+### `CC_POSTGRES_CONNECTION_STRING`
+
+| Field | Value |
+|-------|-------|
+| **Type** | `string` |
+| **Default** | `postgres://backtest:mysecurepassword@localhost:5432/backtest-pro` |
+
+Full PostgreSQL connection URL in the standard `postgres://user:password@host:port/database` format. TypeORM passes this directly to the `pg` driver.
+
+<Warning>
+  When the application itself runs inside a Docker container, `localhost` resolves to the container's own loopback interface — not the host machine. Use `host.docker.internal` as the hostname instead so that the container can reach the PostgreSQL service running on the Docker host or in a sibling container. See the [Example `.env`](#example-env) section below.
+</Warning>
+
+---
+
+### `CC_REDIS_HOST`
+
+| Field | Value |
+|-------|-------|
+| **Type** | `string` |
+| **Default** | `127.0.0.1` |
+
+Hostname of the Redis instance. Set to `host.docker.internal` when the application runs inside Docker and Redis is exposed on the host or via Docker-Compose.
+
+---
+
+### `CC_REDIS_PORT`
+
+| Field | Value |
+|-------|-------|
+| **Type** | `number` |
+| **Default** | `6379` |
+
+TCP port on which Redis is listening. Parsed with `parseInt`; falls back to `6379` if the variable is absent or not a valid integer.
+
+---
+
+### `CC_REDIS_USER`
+
+| Field | Value |
+|-------|-------|
+| **Type** | `string` |
+| **Default** | `default` |
+
+Redis ACL username. The Redis default user is literally named `default`; change this only if you have configured custom ACL users in `redis.conf` or `redis.acl`.
+
+---
+
+### `CC_REDIS_PASSWORD`
+
+| Field | Value |
+|-------|-------|
+| **Type** | `string` |
+| **Default** | `mysecurepassword` |
+
+Redis authentication password. Must match the `requirepass` or ACL password configured on the Redis server.
+
+---
+
+## Docker Container Environment Variables
+
+The following variables are consumed by `@backtest-kit/cli` when the compiled strategy bundle is launched via `docker-compose`. They control execution mode, feature flags, and service overrides. None of them have a server-side default — omitting a variable disables the feature it guards.
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `MODE` | `backtest` \| `live` \| `paper` | Execution mode passed to the strategy runner. `backtest` replays historical candle data; `live` connects to a real exchange; `paper` simulates fills against live prices. |
+| `STRATEGY_FILE` | path string | Path to the compiled strategy bundle consumed by the CLI. Defaults to `./build/index.cjs` when set by `npm run start:docker`. |
+| `ENTRY` | `1` | Must be set to `1` to actually launch the strategy. Acts as a deliberate gate to prevent accidental execution. |
+| `SYMBOL` | string | Override the default symbol defined inside the strategy (e.g. `BTC/USDT`). |
+| `STRATEGY` | string | Override the strategy name reported to the persistence layer. |
+| `EXCHANGE` | string | Override the exchange name (e.g. `binance`, `bybit`). |
+| `FRAME` | string | Override the frame name (time-frame identifier used in session/recent keys). |
+| `UI` | `1` | Enable the `@backtest-kit/ui` web interface on port `60050`. Also required for the Docker health check to pass. |
+| `TELEGRAM` | `1` | Enable Telegram notification dispatch via the configured bot token. |
+| `VERBOSE` | `1` | Enable verbose logging output to stdout. |
+| `NO_CACHE` | `1` | Disable the Redis cache layer entirely; all reads go directly to PostgreSQL. |
+| `NO_FLUSH` | `1` | Disable the Redis cache flush that normally runs on startup. Useful when restarting a container without losing warm cache state. |
+
+---
+
+## npm Scripts
+
+All scripts are defined in `package.json`. Build and launch commands always compile the TypeScript source first via Rollup before starting the CLI or Docker stack.
+
+| Script | Command | Description |
+|--------|---------|-------------|
+| `npm run build` | `rollup -c` | Compiles `src/index.ts` to `build/index.cjs` using `rollup.config.mjs`. |
+| `npm run start` | `npm run build && node .../cli/build/index.mjs` | Builds the bundle then launches `@backtest-kit/cli` directly (no Docker). |
+| `npm run start:debug` | `npm run build && node --inspect-brk .../cli/build/index.mjs` | Builds and launches the CLI with the Node.js debugger paused at startup. Attach Chrome DevTools or VS Code to `localhost:9229`. |
+| `npm run start:repl` | `dotenv -e .env -- npm run build && node -e "require('./build/index.cjs')" --interactive` | Loads `.env`, builds the bundle, then drops into a Node.js REPL with the IoC container fully initialized. Useful for manual inspection. |
+| `npm run start:docker` | `npm run build && cross-env MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d` | Builds the bundle then launches the full Docker-Compose stack (PostgreSQL, PgPool, Redis, and the strategy container) in detached backtest mode. |
+| `npm run stop:docker` | `docker-compose down` | Stops and removes all containers in the Docker-Compose stack. Data volumes are preserved unless you add `--volumes`. |
+
+<Tip>
+  Use `npm run start:repl` during development to explore the live database and Redis state interactively. Because the IoC container is bootstrapped, all repositories and services are available as `require('./build/index.cjs').someExport`.
+</Tip>
+
+---
+
+## TypeScript Configuration
+
+The project's `tsconfig.json` is used exclusively for IDE type-checking and editor tooling — Rollup drives the actual compilation. Key options:
+
+```json
+{
+  "compilerOptions": {
+    "rootDir": "./src/",
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext", "dom"],
+    "types": ["node"],
+    "strict": false,
+    "noImplicitAny": false,
+    "noEmit": true,
+    "downlevelIteration": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "moduleDetection": "force"
+  },
+  "include": ["./src", "./types"]
+}
+```
+
+| Option | Value | Reason |
+|--------|-------|--------|
+| `target` | `ES2020` | Keeps modern syntax (optional chaining, nullish coalescing) intact for Rollup to handle. |
+| `module` | `ESNext` | Emits ES module `import`/`export` syntax consumed by Rollup's tree-shaker. |
+| `moduleResolution` | `bundler` | Resolves bare specifiers the same way a bundler does, supporting `exports` in `package.json`. |
+| `strict` | `false` | Relaxed strictness to keep the backtest strategy authoring surface flexible. |
+| `noEmit` | `true` | TypeScript never writes output files; Rollup owns all emit via `@rollup/plugin-typescript`. |
+| `rootDir` | `./src/` | Constrains source scanning to the `src` directory. |
+
+---
+
+## Rollup Configuration
+
+`rollup.config.mjs` produces two artifacts from `src/index.ts`:
+
+```javascript
+// rollup.config.mjs
+import peerDepsExternal from "rollup-plugin-peer-deps-external";
+import typescript from "@rollup/plugin-typescript";
+import { dts } from "rollup-plugin-dts";
+import path from "path";
+
+export default [
+  {
+    input: "src/index.ts",
+    output: [
+      {
+        file: path.join("build", "index.cjs"),
+        format: "commonjs",
+      },
+    ],
+    plugins: [
+      peerDepsExternal({ includeDependencies: true }),
+      typescript({ tsconfig: "./tsconfig.json", noEmit: true }),
+    ],
+  },
+  {
+    input: "src/index.ts",
+    output: {
+      file: "./types.d.ts",
+      format: "es",
+    },
+    plugins: [dts()],
+  },
+];
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Entry point** | `src/index.ts` |
+| **Primary output** | `build/index.cjs` — CommonJS bundle consumed by `@backtest-kit/cli` |
+| **Type declarations** | `types.d.ts` — aggregated type declarations emitted by `rollup-plugin-dts` |
+| **Externals** | All `dependencies` and `peerDependencies` are externalized via `rollup-plugin-peer-deps-external` with `includeDependencies: true`. Nothing from `node_modules` is bundled into `index.cjs`; packages are resolved at runtime by Node.js. |
+| **TypeScript plugin** | `@rollup/plugin-typescript` performs the transpilation step; `noEmit: true` prevents a secondary `.js` output alongside the bundle. |
+
+<Note>
+  Because all dependencies are externalized, `node_modules` must be present at runtime (i.e., `npm install` must have been run). The Docker-Compose setup mounts the project directory into the container so the installed modules are available.
+</Note>
+
+---
+
+## Health Check Endpoint
+
+When `UI=1` is set, `@backtest-kit/ui` starts an HTTP server on port `60050`. The Docker-Compose service definition uses this endpoint as its health check:
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:60050/api/v1/health/health_check"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
+
+Docker polls `GET http://localhost:60050/api/v1/health/health_check` every **30 seconds**. The container is marked `healthy` once the endpoint returns HTTP `200`, and `unhealthy` after three consecutive failures. Other containers that declare `depends_on: { condition: service_healthy }` will wait until this check passes before starting.
+
+<Warning>
+  If you start the Docker stack without `UI=1`, the health check endpoint will not be available and the container will be permanently marked `unhealthy`. Always set `UI=1` when using `npm run start:docker`.
+</Warning>
+
+---
+
+## Example `.env`
+
+The `.env.example` file shows the values appropriate when the Node.js application runs **outside** Docker (e.g., `npm run start`) but PostgreSQL and Redis are running **inside** Docker-Compose and their ports are forwarded to the host.
+
+```bash
+# .env.example
+CC_REDIS_HOST=host.docker.internal
+CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@host.docker.internal:5432/backtest-pro
+```
+
+Copy it to `.env` before running any `npm run start*` commands:
+
+```bash
+cp .env.example .env
+```
+
+### `localhost` vs `host.docker.internal`
+
+| Scenario | Correct hostname |
+|----------|-----------------|
+| App and services all run natively on the host (no Docker) | `localhost` / `127.0.0.1` |
+| App runs natively; PostgreSQL/Redis run in Docker-Compose with forwarded ports | `host.docker.internal` |
+| App runs inside Docker (`npm run start:docker`); services in sibling containers | Use Docker-Compose service names (e.g., `postgres`, `redis`) or `host.docker.internal` |
+
+<Tip>
+  On Linux, `host.docker.internal` is not automatically available inside containers. Add `extra_hosts: ["host.docker.internal:host-gateway"]` to the relevant service in your `docker-compose.yml` to enable it, or use the Docker-Compose service name directly (e.g., `CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@postgres:5432/backtest-pro`).
+</Tip>

@@ -1,0 +1,278 @@
+---
+title: "BaseCRUD: TypeORM Repository Base Class"
+sidebarTitle: "BaseCRUD"
+description: "BaseCRUD is the TypeORM repository base class inherited by all 16 DB services, providing create, update, findById, findByFilter, and findAll methods."
+---
+
+`BaseCRUD` is a factory-pattern base class — built with `di-factory` — that wraps a TypeORM `EntitySchema` repository. All 16 `XDbService` classes extend `BaseCRUD(XModel)`, receiving a fully wired repository for their entity type along with the five generic CRUD methods. The factory approach means each DB service instantiates `BaseCRUD` with its own `EntitySchema`, so the repository is always correctly typed for that entity without requiring class decorators or inheritance gymnastics.
+
+## Methods
+
+### `repo<T>(): Promise<Repository<T>>`
+
+Returns a TypeORM `Repository` for the entity schema. The `DataSource` is obtained by calling `getPostgres()` on every invocation — because `getPostgres` is itself a singleshot, this is effectively a synchronous lookup after the first connection.
+
+```typescript
+public async repo<T = any>(): Promise<Repository<T>> {
+  const dataSource = await getPostgres();
+  return dataSource.getRepository<T>(this.TargetModel);
+}
+```
+
+---
+
+### `create(dto: object): Promise<any>`
+
+Creates and persists a new entity row. Internally calls `repo.create(dto)` to build the entity instance and `repo.save(entity)` to write it to the database. Returns the saved entity, including any database-generated fields (e.g., auto-generated `id`, `createDate`).
+
+```typescript
+public async create(dto: object) {
+  const repo = await this.repo();
+  const entity = repo.create(dto as any);
+  const saved = await repo.save(entity);
+  return saved as any;
+}
+```
+
+---
+
+### `update(id: string, dto: object): Promise<any>`
+
+Updates an existing row by primary key. The `id` field is stripped from `dto` before calling `repo.update()` to avoid accidentally overwriting the primary key. After the update, the row is re-fetched with `findOne` and returned. Throws `Error("${entityName} not found")` if no row exists for the given `id`.
+
+```typescript
+public async update(id: string, dto: object) {
+  const repo = await this.repo();
+  const { id: _omitId, ...rest } = dto as Record<string, unknown>;
+  await repo.update({ id } as any, rest as any);
+  const updated = await repo.findOne({ where: { id } as any });
+  if (!updated) {
+    throw new Error(`${this.entityName} not found`);
+  }
+  return updated as any;
+}
+```
+
+---
+
+### `findById(id: string): Promise<any>`
+
+Finds a single row by its primary key. Throws `Error("${entityName} not found")` if the row does not exist. Use this method when the row is expected to be present and its absence is an exceptional condition.
+
+```typescript
+public async findById(id: string) {
+  const repo = await this.repo();
+  const item = await repo.findOne({ where: { id } as any });
+  if (!item) {
+    throw new Error(`${this.entityName} not found`);
+  }
+  return item as any;
+}
+```
+
+---
+
+### `findByFilter(filterData: object, order?: object): Promise<any | null>`
+
+Finds the **first** row whose columns match all fields in `filterData`. Accepts an optional `order` object (TypeORM `FindOptionsOrder` shape). Returns `null` if no matching row is found — unlike `findById`, this method never throws on a missing row, making it suitable for cache-miss scenarios.
+
+```typescript
+public async findByFilter(filterData: object, order?: object) {
+  const repo = await this.repo();
+  const item = await repo.findOne({
+    where: filterData as FindOptionsWhere<any>,
+    order: order as FindOptionsOrder<any>,
+  });
+  return (item as any) ?? null;
+}
+```
+
+---
+
+### `findAll(filterData?: object, limit?: number, order?: object): Promise<any[]>`
+
+Finds all rows matching `filterData` up to `limit` (default: `FIND_ALL_LIMIT = 1_000`). Accepts an optional `order` object. Returns an empty array when no rows match — never throws.
+
+```typescript
+public async findAll(filterData: object = {}, limit = FIND_ALL_LIMIT, order?: object) {
+  const repo = await this.repo();
+  const items = await repo.find({
+    where: filterData as FindOptionsWhere<any>,
+    order: order as FindOptionsOrder<any>,
+    take: limit,
+  });
+  return items as any[];
+}
+```
+
+---
+
+## Source Code
+
+```typescript
+import { factory } from "di-factory";
+import {
+  EntitySchema, Repository,
+  FindOptionsOrder, FindOptionsWhere,
+} from "typeorm";
+import { inject } from "../core/di";
+import LoggerService from "../services/base/LoggerService";
+import TYPES from "../core/types";
+import { getPostgres } from "../../config/postgres";
+
+const FIND_ALL_LIMIT = 1_000;
+
+export const BaseCRUD = factory(
+  class {
+    readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+    constructor(public readonly TargetModel: EntitySchema<any>) {}
+
+    public get entityName(): string {
+      return this.TargetModel.options.name;
+    }
+
+    public async repo<T = any>(): Promise<Repository<T>> {
+      const dataSource = await getPostgres();
+      return dataSource.getRepository<T>(this.TargetModel);
+    }
+
+    public async create(dto: object) {
+      this.loggerService.info(`BaseCRUD create entityName=${this.entityName}`, { dto });
+      const repo = await this.repo();
+      const entity = repo.create(dto as any);
+      const saved = await repo.save(entity);
+      return saved as any;
+    }
+
+    public async update(id: string, dto: object) {
+      this.loggerService.info(`BaseCRUD update entityName=${this.entityName}`, { id, dto });
+      const repo = await this.repo();
+      const { id: _omitId, ...rest } = dto as Record<string, unknown>;
+      await repo.update({ id } as any, rest as any);
+      const updated = await repo.findOne({ where: { id } as any });
+      if (!updated) {
+        throw new Error(`${this.entityName} not found`);
+      }
+      return updated as any;
+    }
+
+    public async findById(id: string) {
+      this.loggerService.info(`BaseCRUD findById entityName=${this.entityName}`, { id });
+      const repo = await this.repo();
+      const item = await repo.findOne({ where: { id } as any });
+      if (!item) {
+        throw new Error(`${this.entityName} not found`);
+      }
+      return item as any;
+    }
+
+    public async findByFilter(filterData: object, order?: object) {
+      this.loggerService.info(`BaseCRUD findByFilter entityName=${this.entityName}`, { filterData, order });
+      const repo = await this.repo();
+      const item = await repo.findOne({
+        where: filterData as FindOptionsWhere<any>,
+        order: order as FindOptionsOrder<any>,
+      });
+      return (item as any) ?? null;
+    }
+
+    public async findAll(filterData: object = {}, limit = FIND_ALL_LIMIT, order?: object) {
+      this.loggerService.info(`BaseCRUD findAll entityName=${this.entityName}`, { filterData });
+      const repo = await this.repo();
+      const items = await repo.find({
+        where: filterData as FindOptionsWhere<any>,
+        order: order as FindOptionsOrder<any>,
+        take: limit,
+      });
+      return items as any[];
+    }
+  }
+);
+
+export default BaseCRUD;
+```
+
+## Usage Pattern
+
+Each DB service calls `BaseCRUD(XModel)` to produce a base class, then extends it with domain-specific logic. The pattern below shows `SignalDbService`, which adds Redis cache lookups around the inherited `findByFilter` call:
+
+```typescript
+import BaseCRUD from "../../common/BaseCRUD";
+import { SignalModel } from "../../../schema/Signal.schema";
+import { inject } from "../../core/di";
+import SignalCacheService from "../cache/SignalCacheService";
+import TYPES from "../../core/types";
+
+export class SignalDbService extends BaseCRUD(SignalModel) {
+
+  readonly signalCacheService = inject<SignalCacheService>(TYPES.signalCacheService);
+
+  // Upsert: create or update the signal row for a given trading context
+  public upsert = async (
+    symbol: string,
+    strategyName: string,
+    exchangeName: string,
+    payload: ISignalRow | null,
+  ) => {
+    const existing = await super.findByFilter({ symbol, strategyName, exchangeName });
+    if (existing) {
+      await super.update(existing.id, { ...existing, payload });
+    } else {
+      await super.create({ symbol, strategyName, exchangeName, payload });
+    }
+  };
+
+  // Find with Redis cache as first-level lookup
+  public findByContext = async (
+    symbol: string,
+    strategyName: string,
+    exchangeName: string,
+  ) => {
+    const cachedId = await this.signalCacheService.getSignalId(
+      symbol, strategyName, exchangeName,
+    );
+    if (cachedId) {
+      const cached = await super.findByFilter({ id: cachedId });
+      if (cached) return cached;
+    }
+    const result = await super.findByFilter({ symbol, strategyName, exchangeName });
+    if (result) {
+      await this.signalCacheService.setSignalId(result);
+    }
+    return result;
+  };
+}
+```
+
+<Tip>
+  The `di-factory` pattern means `BaseCRUD(SignalModel)` is evaluated once at
+  module load time, producing a stable base class. TypeScript infers the
+  constructor signature automatically, so `new SignalDbService()` requires no
+  arguments — the `SignalModel` entity schema is baked into the class.
+</Tip>
+
+## `FIND_ALL_LIMIT` Cap
+
+<Note>
+  `findAll` is capped at **1 000 rows** by default (`FIND_ALL_LIMIT = 1_000`).
+  DB services that need all rows for a given filter (e.g.,
+  `logDbService.listAll()`, `storageDbService.listByMode()`) pass their own
+  explicit `limit` or rely on the constant being large enough for their dataset.
+  Callers that require pagination should use `findByFilter` with sequential id
+  comparisons instead.
+</Note>
+
+## `entityName` Getter
+
+The `entityName` property returns `TargetModel.options.name` — the string table name defined in the `EntitySchema` options. It is used in every log message emitted by `BaseCRUD` so that log output identifies the entity being operated on:
+
+```typescript
+public get entityName(): string {
+  return this.TargetModel.options.name;
+}
+
+// Produces log lines such as:
+// BaseCRUD create entityName=signal
+// BaseCRUD findById entityName=candle
+```

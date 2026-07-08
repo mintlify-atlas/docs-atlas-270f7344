@@ -1,0 +1,196 @@
+---
+title: "16 Persist Adapters: backtest-kit Contract on PostgreSQL"
+sidebarTitle: "Adapters"
+description: "Detailed reference for all 16 persist adapters, their backtest-kit interface, table names, unique indexes, and payload types."
+---
+
+Each of the 16 adapters in `src/config/setup.ts` implements a corresponding `IPersist*Instance` interface from the `backtest-kit` package. An adapter is a plain class with constructor fields that form the context key, a `waitForInit` gate, and one or more `read*` / `write*` methods that delegate directly to the corresponding `*DbService` and `*CacheService` in the IoC container. The strategy code, runners, and CLI entrypoint never touch the persistence layer directly — they only call backtest-kit's high-level API, which routes through whichever adapter implementation has been registered.
+
+## Standard adapter pattern
+
+All 16 adapters share the same four-part structure. The constructor declares the context fields that uniquely identify a row in Postgres. `waitForInit` blocks the first I/O call on infra readiness. `read*` delegates to the DbService (Redis-first, Postgres fallback). `write*` calls the atomic upsert, which seeds Redis from the `RETURNING` row.
+
+```typescript
+// Canonical Signal adapter — src/config/setup.ts
+PersistSignalAdapter.usePersistSignalAdapter(class implements IPersistSignalInstance {
+  constructor(
+    readonly symbol: string,
+    readonly strategyName: string,
+    readonly exchangeName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();          // once per process: Postgres + Redis ready
+  }
+
+  async readSignalData(): Promise<ISignalRow | null> {
+    const row = await ioc.signalDbService.findByContext(
+      this.symbol, this.strategyName, this.exchangeName,
+    );
+    return row ? row.payload : null;
+  }
+
+  async writeSignalData(signalRow: ISignalRow | null): Promise<void> {
+    await ioc.signalDbService.upsert(
+      this.symbol, this.strategyName, this.exchangeName, signalRow,
+    );
+  }
+});
+```
+
+## Context-key adapters
+
+Adapters are grouped by the shape of their context key — the set of constructor fields that form the compound unique index on the underlying Postgres table.
+
+### (symbol, interval, exchangeName) — Candle
+
+`PersistCandleAdapter` is **insert-only**. `writeCandlesData` loops over the incoming `CandleData[]` array and calls `ioc.candleDbService.create()` for each entry. A no-op `DO UPDATE SET symbol = EXCLUDED.symbol` ensures `RETURNING *` always yields the row whether it was just inserted or already existed, so the Redis cache is always backfilled without a follow-up `SELECT`.
+
+`readCandlesData(limit, sinceTimestamp)` reconstructs the time-ordered array slot by slot: it iterates from `sinceTimestamp` with `stepMs = INTERVAL_MINUTES[interval] * 60_000` increments and calls `findBySymbolIntervalTimestamp` for each slot. If **any** slot is missing, the method returns `null`, forcing the backtest engine to re-fetch the window from the exchange.
+
+```typescript
+async readCandlesData(limit: number, sinceTimestamp: number) {
+  const stepMs = INTERVAL_MINUTES[this.interval] * MS_PER_MINUTE;
+  const result: CandleData[] = [];
+  for (let i = 0; i < limit; i++) {
+    const ts = sinceTimestamp + i * stepMs;
+    const row = await ioc.candleDbService.findBySymbolIntervalTimestamp(
+      this.symbol, this.interval, ts,
+    );
+    if (!row) return null;   // any missing slot → full re-fetch
+    result.push({ timestamp: row.timestamp, open: row.open, high: row.high,
+                  low: row.low, close: row.close, volume: row.volume });
+  }
+  return result;
+}
+```
+
+### (symbol, strategyName, exchangeName) — Signal, Schedule, Strategy
+
+These three adapters follow the canonical pattern exactly. The payload column type differs per domain:
+
+- **Signal** — `payload: ISignalRow | null` (nullable jsonb; the framework writes `null` to clear state)
+- **Schedule** — `payload: IScheduledSignalRow | null`
+- **Strategy** — `payload: StrategyData | null`
+
+All three use `findByContext` / `upsert` with the same three-field conflict target.
+
+### (symbol, strategyName, exchangeName, signalId) — Partial, Breakeven
+
+These adapters carry a `signalId` argument on `read*` and `write*` (the open signal UUID, supplied by backtest-kit at call time). Both also accept a `when: Date` look-ahead-bias timestamp. The constructor holds only the three base fields; `signalId` is passed per-call.
+
+```typescript
+async readPartialData(signalId: string, _when: Date): Promise<PartialData> {
+  const row = await ioc.partialDbService.findByContext(
+    this.symbol, this.strategyName, this.exchangeName, signalId,
+  );
+  return row ? row.payload : {};
+}
+
+async writePartialData(data: PartialData, signalId: string, when: Date): Promise<void> {
+  await ioc.partialDbService.upsert(
+    this.symbol, this.strategyName, this.exchangeName, signalId, data, when,
+  );
+}
+```
+
+### (riskName, exchangeName) — Risk
+
+`PersistRiskAdapter` stores a snapshot of all active risk positions for a named risk manager on a given exchange. `positions` is a `jsonb` column typed as `RiskData` (an array of position objects). Both `readPositionData` and `writePositionData` accept a `when: Date` argument; the read adapter ignores the value for routing but the write stores it in the `when bigint` column.
+
+### (backtest, signalId) — Storage
+
+`PersistStorageAdapter` stores closed/opened signal records per run mode. The constructor takes `readonly backtest: boolean`. `readStorageData` calls `listByMode(this.backtest)` which returns all rows for the mode; `writeStorageData` iterates the incoming array and upserts each signal individually by `signalId`.
+
+```typescript
+async readStorageData(): Promise<StorageData> {
+  const rows = await ioc.storageDbService.listByMode(this.backtest);
+  return rows.map((row) => row.payload);
+}
+
+async writeStorageData(signals: StorageData): Promise<void> {
+  for (const signal of signals) {
+    await ioc.storageDbService.upsert(this.backtest, signal.id, signal);
+  }
+}
+```
+
+### (backtest, notificationId) — Notification
+
+Mirrors the Storage pattern but reverses the array on read (`rows.map(...).reverse()`), returning notifications in newest-first order to match the UI expectation.
+
+### (entryId) — Log
+
+`PersistLogAdapter` has no constructor arguments — it is a singleton per process. `readLogData` calls `listAll()` and reverses the result. `writeLogData` iterates the entries and upserts each by its `entryId`.
+
+### (bucket, entryKey) — Measure, Interval
+
+Both adapters have a `bucket: string` constructor argument and pass a per-call `key: string` to every method. They both support soft-delete via `removeXData(key)` → `softRemove(bucket, key)`. `listXData()` is an `AsyncGenerator` that calls `listKeys(bucket)` (which filters `removed = false`) and yields each key in turn.
+
+The key difference: **Measure** does **not** have a `when` column and does **not** store a look-ahead timestamp. **Interval** does — `writeIntervalData` forwards `when: Date` to `ioc.intervalDbService.upsert`.
+
+### (signalId, bucketName, memoryId) — Memory
+
+`PersistMemoryAdapter` is the most feature-rich soft-delete adapter. Its constructor takes `signalId` and `bucketName`; `memoryId` is passed per-call. In addition to `readMemoryData` / `writeMemoryData` / `removeMemoryData`, it exposes:
+
+- `hasMemoryData(memoryId)` — delegates to `ioc.memoryDbService.hasMemoryEntry`, which checks both Redis cache and Postgres without loading the full payload.
+- `listMemoryData()` — an `AsyncGenerator<{ memoryId, data }>` that calls `ioc.memoryDbService.listEntries` (filters `removed = false`) and yields each entry.
+- `dispose()` — no-op (lifecycle hook required by the interface).
+
+### (symbol, strategyName, exchangeName, frameName, backtest) — Recent
+
+Stores the last public signal snapshot per strategy frame. The constructor holds all five fields. `writeRecentData` forwards the `when: Date` timestamp alongside the `IPublicSignalRow` payload.
+
+### (signalId, bucketName) — State
+
+Per-signal state buckets. Constructor takes `signalId` and `bucketName`. `writeStateData` stores the generic `StateData` payload plus `when: Date`. `dispose()` is a no-op lifecycle hook.
+
+### (strategyName, exchangeName, frameName, symbol, backtest) — Session
+
+One session record per running strategy instance. The unique index includes `symbol` and `backtest` to prevent two symbols running the same strategy from sharing a session row. `writeSessionData` stores `SessionData` plus `when: Date`. `dispose()` is a no-op.
+
+## Full adapter table
+
+| Adapter | Interface | Table | Unique Index Columns | Payload Type | Soft-Delete | Has `when` |
+|---|---|---|---|---|---|---|
+| Candle | `IPersistCandleInstance` | `candle-items` | `symbol, interval, timestamp` | `CandleData[]` (reconstructed) | No | No |
+| Signal | `IPersistSignalInstance` | `signal-items` | `symbol, strategyName, exchangeName` | `ISignalRow \| null` | No | No |
+| Schedule | `IPersistScheduleInstance` | `schedule-items` | `symbol, strategyName, exchangeName` | `IScheduledSignalRow \| null` | No | No |
+| Strategy | `IPersistStrategyInstance` | `strategy-items` | `symbol, strategyName, exchangeName` | `StrategyData \| null` | No | No |
+| Risk | `IPersistRiskInstance` | `risk-items` | `riskName, exchangeName` | `RiskData` (positions array) | No | Yes |
+| Partial | `IPersistPartialInstance` | `partial-items` | `symbol, strategyName, exchangeName, signalId` | `PartialData` | No | Yes |
+| Breakeven | `IPersistBreakevenInstance` | `breakeven-items` | `symbol, strategyName, exchangeName, signalId` | `BreakevenData` | No | Yes |
+| Storage | `IPersistStorageInstance` | `storage-items` | `backtest, signalId` | `IStorageSignalRow` | No | No |
+| Notification | `IPersistNotificationInstance` | `notification-items` | `backtest, notificationId` | `NotificationData[0]` | No | No |
+| Log | `IPersistLogInstance` | `log-items` | `entryId` | `LogData[0]` | No | No |
+| Measure | `IPersistMeasureInstance` | `measure-items` | `bucket, entryKey` | `MeasureData` | Yes | No |
+| Interval | `IPersistIntervalInstance` | `interval-items` | `bucket, entryKey` | `IntervalData` | Yes | Yes |
+| Memory | `IPersistMemoryInstance` | `memory-items` | `signalId, bucketName, memoryId` | `MemoryData` | Yes | Yes |
+| Recent | `IPersistRecentInstance` | `recent-items` | `symbol, strategyName, exchangeName, frameName, backtest` | `IPublicSignalRow` | No | Yes |
+| State | `IPersistStateInstance` | `state-items` | `signalId, bucketName` | `StateData` | No | Yes |
+| Session | `IPersistSessionInstance` | `session-items` | `strategyName, exchangeName, frameName, symbol, backtest` | `SessionData` | No | Yes |
+
+## Adapter registration
+
+<Note>
+  All 16 adapters are registered by executing `src/config/setup.ts`, which is imported at the top of `src/index.ts` before any strategy logic runs. The `Persist*Adapter.usePersist*Adapter(...)` calls are side-effects that mutate backtest-kit's internal adapter registry. If `setup.ts` is imported after the first adapter call (e.g. after `Backtest.background(...)` is invoked), the adapters will not be in place and backtest-kit falls back to its default file-based persistence.
+</Note>
+
+## waitForInfra gate
+
+The `waitForInfra` singleshot is defined once at module scope in `src/config/setup.ts`. It awaits both `postgresService.waitForInit()` and `redisService.waitForInit()` in parallel, ensuring the TypeORM `DataSource` is initialized (tables created, connections pooled) and the `ioredis` client is connected before any adapter performs its first read or write.
+
+```typescript
+// src/config/setup.ts
+const waitForInfra = singleshot(
+  async () => {
+    await Promise.all([
+      ioc.postgresService.waitForInit(),   // TypeORM DataSource + synchronize
+      ioc.redisService.waitForInit(),      // ioredis client handshake
+    ]);
+  }
+);
+```
+
+The `singleshot` wrapper (from `functools-kit`) memoizes the resolved promise after the first successful run. All subsequent `waitForInfra()` calls return immediately. If the first call rejects (e.g. Postgres is temporarily unavailable), `PostgresService.waitForInit.clear()` resets the memo so the next adapter initialization retries the connection.

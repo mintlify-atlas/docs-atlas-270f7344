@@ -1,0 +1,518 @@
+---
+title: "Database Services: TypeORM Upsert and Query Methods"
+sidebarTitle: "DB Services"
+description: "API reference for all 16 TypeORM database services, their upsert, findByContext, and list methods, extracted from the TypeScript source."
+---
+
+Each database service in the persistence layer extends `BaseCRUD` and adds domain-specific upsert and lookup methods tailored to its entity. Every upsert call uses a single atomic `INSERT … ON CONFLICT … DO UPDATE … RETURNING` statement executed on the primary PostgreSQL node — no read-modify-write round trip, no risk of stale replica reads. The row returned by `RETURNING *` is immediately written into the corresponding Redis cache service, so the very first read after a write is always a cache hit.
+
+<Note>
+  Every row automatically carries `id: string` (UUID v4), `createDate: Date`, and `updatedDate: Date`, managed entirely by TypeORM. You never need to supply these fields in a DTO.
+</Note>
+
+---
+
+## BaseCRUD — inherited methods
+
+All 16 services inherit the following generic methods from `BaseCRUD`. Domain-specific methods are documented per-service below.
+
+```typescript
+class BaseCRUD {
+  repo<T = any>(): Promise<Repository<T>>;
+  create(dto: object): Promise<any>;
+  update(id: string, dto: object): Promise<any>;
+  findById(id: string): Promise<any>;
+  findByFilter(filterData: object, order?: object): Promise<any>;
+  findAll(filterData?: object, limit?: number, order?: object): Promise<any[]>;
+}
+```
+
+---
+
+## CandleDbService
+
+Handles OHLCV (candlestick) data for a symbol/interval pair. `create` is **insert-only**: the `ON CONFLICT DO UPDATE` rewrites only the natural key columns to themselves, so existing OHLCV data is never overwritten. The trick keeps the `RETURNING` clause usable across a PgPool cluster without a follow-up `SELECT` that might hit a lagging replica.
+
+```typescript
+interface ICandleDto {
+  symbol:    string;
+  interval:  CandleInterval; // "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "2h" | "4h" | "6h" | "8h" | "1d"
+  timestamp: number;
+  open:      number;
+  high:      number;
+  low:       number;
+  close:     number;
+  volume:    number;
+}
+
+interface ICandleRow extends ICandleDto {
+  id:           string;
+  exchangeName: string;
+  createDate:   Date;
+  updatedDate:  Date;
+}
+```
+
+```typescript
+class CandleDbService extends BaseCRUD {
+  /** Atomic insert-only upsert. Conflict target: (symbol, interval, timestamp).
+   *  Returns the full row and seeds candleCacheService. */
+  create(dto: ICandleDto): Promise<ICandleRow>;
+
+  /** Returns true if the candle exists. Checks Redis cache first, then DB. */
+  hasCandle(symbol: string, interval: CandleInterval, timestamp: number): Promise<boolean>;
+
+  /** Cache-first lookup by natural key. Backfills cache on a DB hit. */
+  findBySymbolIntervalTimestamp(
+    symbol:    string,
+    interval:  CandleInterval,
+    timestamp: number
+  ): Promise<ICandleRow | null>;
+}
+```
+
+<Tip>
+  `hasCandle` short-circuits on the Redis layer and never touches Postgres when the candle is already cached — safe to call in a tight ingestion loop.
+</Tip>
+
+---
+
+## SignalDbService
+
+Stores the latest trading signal for a `(symbol, strategyName, exchangeName)` context. Payload is the full `ISignalRow` document or `null` to clear.
+
+```typescript
+class SignalDbService extends BaseCRUD {
+  upsert(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    payload:      ISignalRow | null
+  ): Promise<void>;
+
+  findByContext(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string
+  ): Promise<ISignalRowDoc | null>;
+}
+```
+
+---
+
+## ScheduleDbService
+
+Stores the next scheduled signal for a `(symbol, strategyName, exchangeName)` context.
+
+```typescript
+class ScheduleDbService extends BaseCRUD {
+  upsert(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    payload:      IScheduledSignalRow | null
+  ): Promise<void>;
+
+  findByContext(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string
+  ): Promise<IScheduleRow | null>;
+}
+```
+
+---
+
+## StrategyDbService
+
+Persists arbitrary strategy state blobs keyed by `(symbol, strategyName, exchangeName)`.
+
+```typescript
+class StrategyDbService extends BaseCRUD {
+  upsert(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    payload:      StrategyData | null
+  ): Promise<void>;
+
+  findByContext(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string
+  ): Promise<IStrategyRow | null>;
+}
+```
+
+---
+
+## RiskDbService
+
+Tracks the open position map for a named risk manager on an exchange, together with a wall-clock timestamp.
+
+```typescript
+class RiskDbService extends BaseCRUD {
+  upsert(
+    riskName:     string,
+    exchangeName: string,
+    positions:    RiskData,
+    when:         Date
+  ): Promise<void>;
+
+  findByContext(
+    riskName:     string,
+    exchangeName: string
+  ): Promise<IRiskRow | null>;
+}
+```
+
+---
+
+## PartialDbService
+
+Records partial-fill data for an open signal leg, scoped to `(symbol, strategyName, exchangeName, signalId)`.
+
+```typescript
+class PartialDbService extends BaseCRUD {
+  upsert(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    signalId:     string,
+    payload:      PartialData,
+    when:         Date
+  ): Promise<void>;
+
+  findByContext(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    signalId:     string
+  ): Promise<IPartialRow | null>;
+}
+```
+
+---
+
+## BreakevenDbService
+
+Tracks breakeven-adjustment data for a signal leg, scoped to `(symbol, strategyName, exchangeName, signalId)`.
+
+```typescript
+class BreakevenDbService extends BaseCRUD {
+  upsert(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    signalId:     string,
+    payload:      BreakevenData,
+    when:         Date
+  ): Promise<void>;
+
+  findByContext(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    signalId:     string
+  ): Promise<IBreakevenRow | null>;
+}
+```
+
+---
+
+## StorageDbService
+
+Stores completed signal records. `backtest` flag separates live and paper-trading rows in the same table.
+
+```typescript
+class StorageDbService extends BaseCRUD {
+  upsert(
+    backtest: boolean,
+    signalId: string,
+    payload:  IStorageSignalRow
+  ): Promise<void>;
+
+  findBySignalId(
+    backtest: boolean,
+    signalId: string
+  ): Promise<IStorageRow | null>;
+
+  /** Returns all rows for the given mode (live or backtest). */
+  listByMode(backtest: boolean): Promise<IStorageRow[]>;
+}
+```
+
+---
+
+## NotificationDbService
+
+Stores user notifications. `backtest` flag distinguishes simulated from live alerts.
+
+```typescript
+class NotificationDbService extends BaseCRUD {
+  upsert(
+    backtest:       boolean,
+    notificationId: string,
+    payload:        NotificationModel
+  ): Promise<void>;
+
+  findByNotificationId(
+    backtest:       boolean,
+    notificationId: string
+  ): Promise<INotificationRow | null>;
+
+  /** Returns all notifications for the given mode (live or backtest). */
+  listByMode(backtest: boolean): Promise<INotificationRow[]>;
+}
+```
+
+---
+
+## LogDbService
+
+Appends structured log entries. `entryId` is caller-assigned (e.g. a correlation ID or UUID).
+
+```typescript
+class LogDbService extends BaseCRUD {
+  upsert(
+    entryId: string,
+    payload: ILogEntry
+  ): Promise<void>;
+
+  findByEntryId(entryId: string): Promise<ILogRow | null>;
+
+  /** Full table scan — use only for debugging or offline reporting. */
+  listAll(): Promise<ILogRow[]>;
+}
+```
+
+---
+
+## MeasureDbService
+
+Manages named performance-measurement buckets. Soft-remove sets `removed: true` inside the JSONB payload via a server-side `jsonb_set` call — no round-trip read required.
+
+```typescript
+class MeasureDbService extends BaseCRUD {
+  upsert(
+    bucket:   string,
+    entryKey: string,
+    payload:  MeasureData
+  ): Promise<void>;
+
+  findByKey(
+    bucket:   string,
+    entryKey: string
+  ): Promise<IMeasureRow | null>;
+
+  /** Server-side jsonb_set marks payload.removed = true. Atomic, no read needed. */
+  softRemove(bucket: string, entryKey: string): Promise<void>;
+
+  /** Returns only entryKey strings where removed = false. */
+  listKeys(bucket: string): Promise<string[]>;
+}
+```
+
+---
+
+## IntervalDbService
+
+Manages time-interval entries within named buckets. Like `MeasureDbService` it supports soft-removal, but also exposes `clearBucket` for wiping an entire bucket at once — useful when a strategy resets its interval tracking.
+
+```typescript
+class IntervalDbService extends BaseCRUD {
+  upsert(
+    bucket:   string,
+    entryKey: string,
+    payload:  IntervalData,
+    when:     Date
+  ): Promise<void>;
+
+  findByKey(
+    bucket:   string,
+    entryKey: string
+  ): Promise<IIntervalRow | null>;
+
+  /** Server-side jsonb_set marks payload.removed = true and sets removed = true. */
+  softRemove(bucket: string, entryKey: string): Promise<void>;
+
+  /** Returns only entryKey strings where removed = false. */
+  listKeys(bucket: string): Promise<string[]>;
+
+  /** Hard-deletes all rows in the bucket and purges their cache entries. */
+  clearBucket(bucket: string): Promise<void>;
+}
+```
+
+<Note>
+  `clearBucket` iterates every row in the bucket, calls `intervalCacheService.deleteIntervalId` for each key, then issues a single `DELETE WHERE bucket = ?`. Cache consistency is maintained even on a hard delete.
+</Note>
+
+---
+
+## MemoryDbService
+
+Provides per-signal, per-bucket key-value memory storage. Useful for strategy state that must survive process restarts.
+
+```typescript
+class MemoryDbService extends BaseCRUD {
+  upsert(
+    signalId:   string,
+    bucketName: string,
+    memoryId:   string,
+    payload:    MemoryData,
+    when:       Date
+  ): Promise<void>;
+
+  findByMemoryId(
+    signalId:   string,
+    bucketName: string,
+    memoryId:   string
+  ): Promise<IMemoryRow | null>;
+
+  /** Cache-first existence check. */
+  hasMemoryEntry(
+    signalId:   string,
+    bucketName: string,
+    memoryId:   string
+  ): Promise<boolean>;
+
+  softRemove(
+    signalId:   string,
+    bucketName: string,
+    memoryId:   string
+  ): Promise<void>;
+
+  /** Returns all non-removed rows for (signalId, bucketName). */
+  listEntries(
+    signalId:   string,
+    bucketName: string
+  ): Promise<IMemoryRow[]>;
+}
+```
+
+---
+
+## RecentDbService
+
+Tracks the most recent public signal snapshot for a `(symbol, strategyName, exchangeName, frameName, backtest)` context.
+
+```typescript
+class RecentDbService extends BaseCRUD {
+  upsert(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    frameName:    string,
+    backtest:     boolean,
+    payload:      IPublicSignalRow,
+    when:         Date
+  ): Promise<void>;
+
+  findByContext(
+    symbol:       string,
+    strategyName: string,
+    exchangeName: string,
+    frameName:    string,
+    backtest:     boolean
+  ): Promise<IRecentRow | null>;
+}
+```
+
+---
+
+## StateDbService
+
+Stores arbitrary per-signal state blobs in named buckets, enabling resume-after-restart for long-running signal lifecycles.
+
+```typescript
+class StateDbService extends BaseCRUD {
+  upsert(
+    signalId:   string,
+    bucketName: string,
+    payload:    StateData,
+    when:       Date
+  ): Promise<void>;
+
+  findByContext(
+    signalId:   string,
+    bucketName: string
+  ): Promise<IStateRow | null>;
+}
+```
+
+---
+
+## SessionDbService
+
+Stores per-strategy session metadata, keyed by `(strategyName, exchangeName, frameName, symbol, backtest)`.
+
+```typescript
+class SessionDbService extends BaseCRUD {
+  upsert(
+    strategyName: string,
+    exchangeName: string,
+    frameName:    string,
+    symbol:       string,
+    backtest:     boolean,
+    payload:      SessionData,
+    when:         Date
+  ): Promise<void>;
+
+  findByContext(
+    strategyName: string,
+    exchangeName: string,
+    frameName:    string,
+    symbol:       string,
+    backtest:     boolean
+  ): Promise<ISessionRow | null>;
+}
+```
+
+---
+
+## Common row shape
+
+Every entity row returned from the database carries three auto-managed fields injected by TypeORM:
+
+| Field         | Type     | Description                                      |
+|---------------|----------|--------------------------------------------------|
+| `id`          | `string` | UUID v4 primary key, generated on insert         |
+| `createDate`  | `Date`   | Timestamp of the first insert, never updated     |
+| `updatedDate` | `Date`   | Timestamp of the most recent upsert              |
+
+---
+
+## Accessing services via the IoC container
+
+All 16 DB services (and their cache counterparts) are pre-wired in the default IoC container exported as `ioc`. Import it and await the service method directly — no instantiation required.
+
+```typescript
+import ioc from "./lib";
+
+// Look up the latest signal for a context
+const row = await ioc.signalDbService.findByContext(
+  "BTCUSDT",
+  "momentum_v2",
+  "ccxt_binance"
+);
+
+// Upsert a candle
+const candle = await ioc.candleDbService.create({
+  symbol:    "BTCUSDT",
+  interval:  "1h",
+  timestamp: 1_700_000_000_000,
+  open:  34_100,
+  high:  34_500,
+  low:   33_900,
+  close: 34_300,
+  volume: 420.5,
+});
+
+// Clear all interval entries in a bucket
+await ioc.intervalDbService.clearBucket("momentum_v2:BTCUSDT");
+```
+
+<Tip>
+  The `ioc` object is a singleton. All service references inside it are also singletons resolved via the DI container — safe to destructure at module scope.
+</Tip>

@@ -1,20 +1,68 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "backtest-kit Redis + PostgreSQL + Pgpool"
+sidebarTitle: "Home"
+description: "Production-grade PostgreSQL + Redis persistence for backtest-kit with atomic upserts, O(1) Redis cache, and a Pgpool-II replica cluster for safe development."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+backtest-kit Redis + PostgreSQL + Pgpool replaces the default file-based `./dump/` persistence in [backtest-kit](https://github.com/tripolskypetr/backtest-kit) with **PostgreSQL** (via TypeORM) as the durable source of truth and **Redis** as an O(1) ID lookup cache. It ships 16 persist adapters that implement the full `IPersist*Instance` contract, a Pgpool-II streaming-replica dev cluster, and ready-to-use Docker Compose files so the entire stack starts with one command.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Understand the architecture, design goals, and how the persistence layer fits into backtest-kit.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Start the infrastructure and run your first backtest in under five minutes.
+  </Card>
+  <Card title="Persistence Layer" icon="database" href="/persistence/overview">
+    Learn how the 16 adapters map backtest-kit contracts to PostgreSQL tables and Redis cache.
+  </Card>
+  <Card title="Atomicity" icon="shield-check" href="/persistence/atomicity">
+    Deep-dive into the ON CONFLICT upsert pattern that prevents race conditions on replica clusters.
+  </Card>
+  <Card title="Docker Layout" icon="docker" href="/infrastructure/docker-layout">
+    Understand the three Docker Compose files and how the containers are wired together.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/reference/configuration">
+    Full reference for all environment variables consumed by the app and container stack.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## How it works
+
+<Steps>
+  <Step title="Start the infrastructure">
+    Spin up the Pgpool-II cluster (1 primary + 2 streaming replicas) and Redis with two `docker-compose` commands. First boot takes ~60–90 seconds while the replicas clone.
+  </Step>
+  <Step title="Register the persist adapters">
+    `src/config/setup.ts` registers all 16 `Persist*Adapter` implementations against backtest-kit's adapter hooks. No changes to strategy code are required.
+  </Step>
+  <Step title="Run in your chosen mode">
+    Use `--backtest`, `--live`, or `--paper` flags (or the `MODE` env var in Docker) to select the execution mode. The same adapters serve all three modes.
+  </Step>
+  <Step title="Data durability by default">
+    Every write goes through an atomic `INSERT … ON CONFLICT … DO UPDATE … RETURNING` statement, so state survives restarts and is always consistent — even when reads are load-balanced across async replicas.
+  </Step>
+</Steps>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="16 Persist Adapters" icon="layer-group" href="/persistence/adapters">
+    Full coverage of the backtest-kit IPersist* contract: Candle, Signal, Strategy, Risk, Partial, Breakeven, Storage, Notification, Log, Measure, Interval, Memory, Recent, State, Session, Schedule.
+  </Card>
+  <Card title="Atomic Upserts" icon="bolt" href="/persistence/atomicity">
+    Single-statement ON CONFLICT … DO UPDATE … RETURNING eliminates read-then-write races and replica-lag surprises.
+  </Card>
+  <Card title="O(1) Redis Cache" icon="gauge-high" href="/infrastructure/redis-cache">
+    Each domain has a cache service that stores only the row UUID in Redis, turning hot-path lookups from O(log n) B-tree scans into O(1) hash gets.
+  </Card>
+  <Card title="Pgpool-II Dev Cluster" icon="server" href="/infrastructure/pgpool-cluster">
+    A single container image runs 1 primary + 2 streaming replicas behind Pgpool-II, so replication-lag bugs surface in development — not in production.
+  </Card>
+  <Card title="Look-Ahead Bias Guard" icon="clock" href="/persistence/look-ahead-bias">
+    Signal-affecting tables store a when bigint column with the logical simulation timestamp, enabling backtest-kit to prevent future-data leakage.
+  </Card>
+  <Card title="Zero Migration Overhead" icon="wand-magic-sparkles" href="/reference/schemas">
+    TypeORM synchronize: true creates all tables and unique indexes automatically on first boot — no migration scripts needed.
+  </Card>
+</CardGroup>

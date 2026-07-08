@@ -1,0 +1,188 @@
+---
+title: "Live Trading Mode: Real-Time Strategy Execution"
+sidebarTitle: "Live Mode"
+description: "How live mode connects to a real exchange via CCXT, initializes persistence services, and runs Live.background() for real-time signal generation."
+---
+
+Live mode connects to a real exchange and executes the trading strategy against live market data as it arrives. The entry point is `src/main/live.ts`, which gates execution on the `--entry` and `--live` CLI flags. Because the same PostgreSQL and Redis persistence adapters that power backtest mode are used unchanged in live mode, there is no code path to swap out — only the CLI flag and the `backtest` boolean in context keys differ. Candles are fetched on-demand from the exchange rather than from a pre-warmed cache, and `Live.background()` replaces `Backtest.background()`.
+
+<Warning>
+  Live mode uses real exchange credentials and will execute real trades on a live market. Always validate your strategy with paper mode before switching to live mode.
+</Warning>
+
+## Entry Point
+
+The full source of `src/main/live.ts` is shown below. Notice that it imports `Live` instead of `Backtest` and `warmCandles`, and passes `false` to `waitForReady` to indicate live (non-backtest) operation.
+
+```typescript
+// src/main/live.ts
+import { getArgs } from "../helpers/getArgs";
+import ioc from "../lib";
+import { Live, waitForReady } from "backtest-kit";
+import { ExchangeName } from "../enum/ExchangeName";
+import { StrategyName } from "../enum/StrategyName";
+
+const main = async () => {
+
+  const { values } = getArgs();
+
+  if (!values.entry) {
+    return;
+  }
+
+  if (!values.live) {
+    return;
+  }
+
+  {
+    await ioc.postgresService.waitForInit();
+    await ioc.redisService.waitForInit();
+  }
+
+  await waitForReady(false);
+
+  Live.background("TRXUSDT", {
+    exchangeName: ExchangeName.CCXT,
+    strategyName: StrategyName.Jan2026Strategy,
+  });
+};
+
+main();
+```
+
+`Live.background()` takes fewer arguments than `Backtest.background()` — there is no `frameName` because live mode has no predefined time window. The process runs indefinitely, waking on each new candle close.
+
+## Key Differences from Backtest Mode
+
+The following aspects change between backtest and live — everything else, including the full adapter stack, the strategy code, and the database schema, remains identical.
+
+| Aspect | Backtest Mode | Live Mode |
+|--------|--------------|-----------|
+| CLI flag | `--backtest` | `--live` |
+| `MODE` env var | `backtest` | `live` |
+| `waitForReady` param | `true` | `false` |
+| Entry function | `Backtest.background()` | `Live.background()` |
+| Candle source | PostgreSQL (pre-warmed) | Live exchange on-demand |
+| `warmCandles` call | Required | Not present |
+| Frame required | Yes (`frameName`) | No |
+| `backtest` in adapters | `true` | `false` |
+| Order execution | Simulated | **Real** |
+
+## Exchange Module
+
+Live mode uses the same `addExchangeSchema` registration as backtest. The exchange schema is defined in `modules/live.module.ts` and registers the exchange name `"ccxt-exchange"` (resolved via `ExchangeName.CCXT`) backed by CCXT Binance with spot market type, rate limiting enabled, and a 60-second receive window.
+
+```typescript
+// modules/live.module.ts (excerpt)
+import { addExchangeSchema, roundTicks, setConfig } from "backtest-kit";
+import { singleshot } from "functools-kit";
+import ccxt from "ccxt";
+
+setConfig({
+  CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100,
+});
+
+const getExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    options: {
+      defaultType: "spot",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = await getExchange();
+    const candles = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit,
+    );
+    return candles.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }));
+  },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => {
+    if (backtest) {
+      throw new Error(
+        "Order book fetching is not supported in backtest mode for the default exchange schema.",
+      );
+    }
+    const exchange = await getExchange();
+    const bookData = await exchange.fetchOrderBook(symbol, depth);
+    return {
+      symbol,
+      asks: bookData.asks.map(([price, quantity]) => ({
+        price: String(price),
+        quantity: String(quantity),
+      })),
+      bids: bookData.bids.map(([price, quantity]) => ({
+        price: String(price),
+        quantity: String(quantity),
+      })),
+    };
+  },
+  // formatPrice and formatQuantity use market tick/step sizes via roundTicks
+});
+```
+
+The `getExchange` call is memoized with `singleshot`, so the CCXT Binance instance is created once and reused for the lifetime of the process. Note that `getOrderBook` explicitly throws if `backtest: true` is passed — in live mode this guard is never triggered.
+
+## Initialization Sequence
+
+<Steps>
+  <Step title="CLI flags checked">
+    `getArgs()` returns early if `--entry` or `--live` is not present. The `--live`, `--backtest`, and `--paper` flags are mutually independent booleans; passing `--live` has no effect on the others.
+  </Step>
+  <Step title="postgresService.waitForInit()">
+    Connects to PostgreSQL via PgBouncer/PgPool with a 15-second timeout. All adapter writes — positions, signals, notifications, sessions — land in the same tables used by backtest mode. The `backtest` column value (`false`) partitions live records from historical ones.
+  </Step>
+  <Step title="redisService.waitForInit()">
+    Connects to Redis for the candle cache and notification bus. In live mode Redis still caches recently fetched candles to reduce exchange API calls across consecutive strategy ticks.
+  </Step>
+  <Step title="waitForReady(false)">
+    Signals live (non-backtest) mode to backtest-kit internals. The `false` argument propagates to the `backtest` boolean in every adapter context key.
+  </Step>
+  <Step title="Live.background()">
+    Starts the live signal loop as a non-blocking background process. On each candle close, it fetches the latest OHLCV data from the exchange, invokes the strategy's `getSignal`, and persists any resulting positions or notifications through the adapter stack.
+  </Step>
+</Steps>
+
+## Running Live Mode
+
+```bash
+# Local Node process, dockerized Postgres + Redis + PgPool
+npm run start -- --entry --live --ui ./build/index.cjs
+
+# Full Docker Compose (all services including Node)
+MODE=live ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+```
+
+The `--ui` flag (or `UI=1` in Docker) loads the compiled strategy bundle at `STRATEGY_FILE`. This bundle must export the `addStrategySchema` call for `jan_2026_strategy` (or whichever `StrategyName` is referenced) before `Live.background()` runs.
+
+## Persistence in Live Mode
+
+All 16 backtest-kit persistence adapters operate identically in live mode. There is no mode-specific adapter code — the `backtest` boolean embedded in context keys is the only runtime difference.
+
+The key partitioning works as follows:
+
+| Adapter group | Context key includes `backtest` | Live value |
+|--------------|-------------------------------|------------|
+| Storage | Yes | `false` |
+| Notification | Yes | `false` |
+| Session | Yes | `false` |
+| Recent | Yes | `false` |
+
+This means live records and paper records share the `backtest=false` partition in the database, while historical backtest records are stored under `backtest=true`. If you need to separate live from paper records at the query level, add a secondary filter on a `mode` column or use separate database schemas.

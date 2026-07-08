@@ -1,0 +1,123 @@
+---
+title: "Environment Variables Reference for backtest-kit Docker Stack"
+sidebarTitle: "Env Variables"
+description: "Complete reference for all environment variables consumed by the app and Docker containers, including Postgres connection string, Redis credentials, and execution mode flags."
+---
+
+Environment variables configure both the Node.js application and the Docker containers that support it. Variables prefixed `CC_` are read directly by the TypeScript source at startup (via `src/config/params.ts`). Variables without that prefix are consumed by the backtest-kit CLI runner or forwarded to the running strategy via the `environment` section of the root `docker-compose.yaml`. All application variables have sensible defaults that match the dev compose files, so the stack works out of the box with zero configuration.
+
+---
+
+## Application Variables
+
+These variables are read by `src/config/params.ts` using `process.env`. The defaults shown below are the compiled fallback values — they match the credentials used by the bundled compose files.
+
+<ParamField path="CC_POSTGRES_CONNECTION_STRING" type="string" default="postgres://backtest:mysecurepassword@localhost:5432/backtest-pro">
+  Full libpq-style connection string for the PostgreSQL database (or Pgpool-II endpoint). Change the host to `host.docker.internal` when running the app inside Docker while the database is on the host.
+</ParamField>
+
+<ParamField path="CC_REDIS_HOST" type="string" default="127.0.0.1">
+  Hostname or IP address of the Redis server. Use `host.docker.internal` when the app runs inside a Docker container.
+</ParamField>
+
+<ParamField path="CC_REDIS_PORT" type="number" default="6379">
+  TCP port on which Redis is listening.
+</ParamField>
+
+<ParamField path="CC_REDIS_USER" type="string" default="default">
+  Redis ACL username. The bundled `docker/redis/docker-compose.yaml` uses the built-in `default` user.
+</ParamField>
+
+<ParamField path="CC_REDIS_PASSWORD" type="string" default="mysecurepassword">
+  Password for the Redis connection. Must match the `--requirepass` value set in the Redis compose file.
+</ParamField>
+
+---
+
+## Docker / CLI Variables
+
+These variables are passed through to the backtest-kit CLI runner via the `environment` block of the root `docker-compose.yaml`. They control execution mode, strategy selection, and optional features. None of them have hard-coded defaults in the compose file — the runner provides its own defaults when they are unset.
+
+| Variable | Values / Example | Description |
+|---|---|---|
+| `MODE` | `backtest` \| `live` \| `paper` | Execution mode for the strategy runner. |
+| `STRATEGY_FILE` | `./build/index.cjs` | Path (relative to `/workspace`) to the compiled strategy bundle. |
+| `ENTRY` | `1` | Set to `1` to actually start execution. Without this, the container starts but the runner remains idle. |
+| `SYMBOL` | `BTCUSDT` | Override the trading symbol defined inside the strategy file. |
+| `STRATEGY` | `myStrategy` | Override the strategy name defined inside the strategy file. |
+| `EXCHANGE` | `binance` | Override the exchange name defined inside the strategy file. |
+| `FRAME` | `1h` | Override the candlestick frame defined inside the strategy file. |
+| `UI` | `1` | Enable the web UI served on port **60050**. |
+| `TELEGRAM` | `1` | Enable Telegram trade notifications (requires bot token configured inside the strategy). |
+| `VERBOSE` | `1` | Enable verbose structured logging throughout the runner and persistence layer. |
+| `NO_CACHE` | `1` | Disable Redis caching entirely — all reads go directly to PostgreSQL. |
+| `NO_FLUSH` | `1` | Skip the Redis cache flush that normally runs on startup. Useful when you want to preserve a warm cache across restarts. |
+
+---
+
+## Pgpool Cluster Variables
+
+These variables are set in `docker/pgpool/docker-compose.yaml` and are read by the `tripolskypetr/pgpool:latest` container entrypoint. They configure the PostgreSQL application role, the streaming-replication role, and internal filesystem paths.
+
+<ParamField path="POSTGRES_USER" type="string" default="backtest">
+  The application database role. This must match the username in `CC_POSTGRES_CONNECTION_STRING`.
+</ParamField>
+
+<ParamField path="POSTGRES_PASSWORD" type="string" default="mysecurepassword">
+  Password for `POSTGRES_USER`. Must match the password in `CC_POSTGRES_CONNECTION_STRING`.
+</ParamField>
+
+<ParamField path="POSTGRES_DB" type="string" default="backtest-pro">
+  The database to create and connect to. Must match the database name in `CC_POSTGRES_CONNECTION_STRING`.
+</ParamField>
+
+<ParamField path="REPL_USER" type="string" default="replicator">
+  Internal PostgreSQL role used exclusively for streaming replication between the primary and replicas. The application never connects as this user.
+</ParamField>
+
+<ParamField path="REPL_PASSWORD" type="string" default="replicatorpass">
+  Password for `REPL_USER`. Change this in production; it is never exposed outside the container network.
+</ParamField>
+
+<ParamField path="PGCLUSTER_ROOT" type="string" default="/var/lib/pgcluster">
+  Root data directory inside the container where the primary and replica data directories are stored. Bind-mounted to `./data` on the host.
+</ParamField>
+
+<ParamField path="PGBIN" type="string" default="/usr/local/bin">
+  Directory containing the PostgreSQL binary executables (`pg_basebackup`, `pg_ctl`, `psql`, etc.) inside the container. Rarely needs changing.
+</ParamField>
+
+---
+
+## Example .env File
+
+The `.env.example` file in the repository root shows the minimal overrides needed when running the app inside Docker (i.e. when the databases are on the host):
+
+```bash
+# .env.example
+CC_REDIS_HOST=host.docker.internal
+CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@host.docker.internal:5432/backtest-pro
+```
+
+Copy this to `.env` before running `docker-compose up`. When running Node.js directly on the host, you can omit the file entirely and rely on the defaults.
+
+---
+
+## Production Override Example
+
+To point the application at a remote PostgreSQL server and Redis instance, export the relevant variables before starting the process (or add them to your deployment environment):
+
+```bash
+export CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@prod-postgres:5432/backtest-pro
+export CC_REDIS_HOST=prod-redis
+export CC_REDIS_PORT=6379
+export CC_REDIS_PASSWORD=your-secure-password
+```
+
+For Docker deployments, add these to the `env_file` or the `environment` block in your production compose override file.
+
+---
+
+<Tip>
+  All `CC_*` application variables have defaults that exactly match the credentials in the bundled dev compose files. This means you can clone the repo, run `docker-compose -f docker/pgpool/docker-compose.yaml up -d` and `docker-compose -f docker/redis/docker-compose.yaml up -d`, and then `node build/index.cjs` — no `.env` file required at all for host-side development.
+</Tip>

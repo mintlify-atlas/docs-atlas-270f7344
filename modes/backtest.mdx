@@ -1,0 +1,197 @@
+---
+title: "Run Backtests with PostgreSQL Persistence and Candle Warmup"
+sidebarTitle: "Backtest Mode"
+description: "How the backtest entry point initializes PostgreSQL and Redis, warms the candle cache, and runs Backtest.background() against historical OHLCV data."
+---
+
+Backtest mode replays historical OHLCV data against a trading strategy using the PostgreSQL-backed persistence layer. The entry point is `src/main/backtest.ts`, which gates all execution behind two CLI flags — `--entry` and `--backtest` — so the same compiled bundle can be used for every mode without accidental cross-activation. When both flags are present, the process initializes Postgres and Redis, pre-populates the candle cache via `warmCandles`, then hands off to `Backtest.background()` to run the replay loop.
+
+## Entry Point
+
+The full source of `src/main/backtest.ts` is shown below. Every symbol, enum value, and date range referenced here maps directly to a registered schema — the frame for the time window and the strategy for signal generation.
+
+```typescript
+// src/main/backtest.ts
+import { getArgs } from "../helpers/getArgs";
+import ioc from "../lib";
+import { Backtest, warmCandles, waitForReady } from "backtest-kit";
+import { ExchangeName } from "../enum/ExchangeName";
+import { FrameName } from "../enum/FrameName";
+import { StrategyName } from "../enum/StrategyName";
+
+const main = async () => {
+
+  const { values } = getArgs();
+
+  if (!values.entry) {
+    return;
+  }
+
+  if (!values.backtest) {
+    return;
+  }
+
+  {
+    await ioc.postgresService.waitForInit();
+    await ioc.redisService.waitForInit();
+  }
+
+  await waitForReady(true);
+
+  await warmCandles({
+    exchangeName: ExchangeName.CCXT,
+    from: new Date("2026-01-01T00:00:00Z"),
+    to: new Date("2026-01-31T23:59:59Z"),
+    interval: "1m",
+    symbol: "TRXUSDT",
+  });
+
+  Backtest.background("TRXUSDT", {
+    exchangeName: ExchangeName.CCXT,
+    frameName: FrameName.Jan2026Frame,
+    strategyName: StrategyName.Jan2026Strategy,
+  });
+};
+
+main();
+```
+
+The three enums resolve to their registered string identifiers at runtime:
+
+| Enum | Value |
+|------|-------|
+| `ExchangeName.CCXT` | `"ccxt-exchange"` |
+| `FrameName.Jan2026Frame` | `"jan_2026_frame"` |
+| `StrategyName.Jan2026Strategy` | `"jan_2026_strategy"` |
+
+## Initialization Sequence
+
+The startup flow is strictly ordered. Each step must succeed before the next begins — any failure throws and halts the process.
+
+<Steps>
+  <Step title="CLI flags checked">
+    `getArgs()` parses `process.argv` via Node's built-in `parseArgs`. If either `--entry` or `--backtest` is absent (or false by default), `main()` returns immediately with no side effects. This allows backtest, live, and paper entry points to coexist in the same bundle.
+  </Step>
+  <Step title="postgresService.waitForInit()">
+    Resolves once the PostgreSQL connection pool (routed through PgBouncer/PgPool) is ready to accept queries. Times out after 15 seconds if the database is unreachable. All 16 persistence adapters depend on this connection being established before any read or write is attempted.
+  </Step>
+  <Step title="redisService.waitForInit()">
+    Resolves once the Redis client has successfully connected and is ready for pub/sub and key-value operations. Times out after 15 seconds. Redis acts as the in-process candle cache and real-time notification bus that sits in front of PostgreSQL.
+  </Step>
+  <Step title="waitForReady(true)">
+    Signals to the backtest-kit internals that services are initialized and that the runtime should operate in **backtest mode** (`true`). This sets the `backtest` boolean that flows into every adapter context key — Storage, Session, Notification, and Recent — ensuring historical records are partitioned away from live or paper data.
+  </Step>
+  <Step title="warmCandles()">
+    Fetches every 1-minute OHLCV candle for `TRXUSDT` across the full January 2026 window from the CCXT Binance exchange and writes them into the `candle_items` PostgreSQL table. Subsequent reads during the replay loop are served entirely from PostgreSQL (and the Redis layer in front of it), with no live exchange calls.
+  </Step>
+  <Step title="Backtest.background()">
+    Starts the replay loop as a non-blocking background process. It ticks through each candle timestep defined by the frame, calling the strategy's `getSignal` on every bar. Signal state, positions, and notifications are persisted via the full adapter stack.
+  </Step>
+</Steps>
+
+## Frame Definition
+
+The frame tells `Backtest.background()` the temporal boundaries and candle interval for the replay. The `jan_2026_frame` schema is registered in `src/logic/frame/jan_2026.frame.ts`:
+
+```typescript
+// src/logic/frame/jan_2026.frame.ts
+import { addFrameSchema } from "backtest-kit";
+import { FrameName } from "../../enum/FrameName";
+
+addFrameSchema({
+  frameName: FrameName.Jan2026Frame,
+  interval: "1m",
+  startDate: new Date("2026-01-01T00:00:00Z"),
+  endDate: new Date("2026-01-31T23:59:59Z"),
+  note: "January 2026",
+});
+```
+
+The frame's `interval`, `startDate`, and `endDate` must exactly match the parameters passed to `warmCandles`. A mismatch — for example warming a `5m` interval but running a `1m` frame — will result in cache misses during the replay.
+
+## The warmCandles Utility
+
+`warmCandles` is a backtest-kit function that pre-populates the `candle_items` table in PostgreSQL before the replay begins. Understanding its role is important for both correctness and performance.
+
+**Without warmup**, the candle adapter would attempt a live exchange fetch on every bar during replay. This is slow, rate-limited by the exchange, and non-deterministic — the exchange may not return exactly the same candles on repeated runs.
+
+**With warmup**, the complete candle history for the target symbol and date range is fetched once, written to `candle_items`, and from that point forward all reads during the replay are served from PostgreSQL. Redis caches the most recently accessed candles to reduce database round-trips further.
+
+```typescript
+await warmCandles({
+  exchangeName: ExchangeName.CCXT,  // "ccxt-exchange"
+  from: new Date("2026-01-01T00:00:00Z"),
+  to: new Date("2026-01-31T23:59:59Z"),
+  interval: "1m",
+  symbol: "TRXUSDT",
+});
+```
+
+The `exchangeName` here must match an `addExchangeSchema` registration — in this project, `"ccxt-exchange"` backed by CCXT Binance spot.
+
+## Running Backtest Mode
+
+Two launch paths are supported: running Node directly against the dockerized infrastructure, or running everything inside Docker Compose.
+
+```bash
+# Local Node process, dockerized Postgres + Redis + PgPool
+npm run start -- --entry --backtest --ui ./build/index.cjs
+
+# Full Docker Compose (all services including Node)
+MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+```
+
+When using the Docker path, `MODE=backtest` is translated to `--backtest` by the container entrypoint, and `ENTRY=1` maps to `--entry`. `STRATEGY_FILE` points to the compiled strategy bundle that is dynamically imported by the UI adapter.
+
+## Customizing the Backtest
+
+To run a different symbol, time window, or strategy, adjust the following three areas in lockstep:
+
+**1. Update `warmCandles` parameters** to match the new target:
+
+```typescript
+await warmCandles({
+  exchangeName: ExchangeName.CCXT,
+  from: new Date("2026-02-01T00:00:00Z"),
+  to: new Date("2026-02-28T23:59:59Z"),
+  interval: "1m",
+  symbol: "BTCUSDT",
+});
+```
+
+**2. Register a new frame** with matching boundaries using `addFrameSchema`, and add the new name to `FrameName`:
+
+```typescript
+// src/enum/FrameName.ts
+export enum FrameName {
+  Jan2026Frame = "jan_2026_frame",
+  Feb2026Frame = "feb_2026_frame",  // new
+}
+
+// src/logic/frame/feb_2026.frame.ts
+addFrameSchema({
+  frameName: FrameName.Feb2026Frame,
+  interval: "1m",
+  startDate: new Date("2026-02-01T00:00:00Z"),
+  endDate: new Date("2026-02-28T23:59:59Z"),
+  note: "February 2026",
+});
+```
+
+**3. Add a `Backtest.background()` call** for each symbol you want to replay simultaneously:
+
+```typescript
+Backtest.background("BTCUSDT", {
+  exchangeName: ExchangeName.CCXT,
+  frameName: FrameName.Feb2026Frame,
+  strategyName: StrategyName.Jan2026Strategy,
+});
+```
+
+Multiple concurrent replays are supported — each call manages its own independent position and signal state scoped by symbol.
+
+## Look-Ahead Bias Prevention
+
+<Note>
+  Backtest mode passes `backtest: true` to every adapter call. The `when: Date` column attached to all persisted records represents the **simulated time** of the replay, not `Date.now()`. The adapter stack uses this value for time-ordering candle reads, position lifecycle management, and signal evaluation — ensuring that no future candle data can influence a signal that is evaluated at an earlier simulated timestamp. Strategies that call `getCandles`, `getClosePrice`, or any position utility receive only data that would have been available at that point in simulated time.
+</Note>

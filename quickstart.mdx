@@ -1,47 +1,186 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with backtest-kit PostgreSQL + Redis in Minutes"
+sidebarTitle: "Quickstart"
+description: "Start the Pgpool-II cluster and Redis, then run a backtest or live strategy with PostgreSQL persistence in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through standing up the complete PostgreSQL + Redis + Pgpool-II stack and executing a strategy in backtest mode. By the end you will have a running Pgpool-II cluster (1 primary + 2 streaming replicas), a Redis instance, and a compiled strategy bundle running against real historical candle data — all wired to the 16 persist adapters without changing a single line of strategy code.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before starting, make sure the following are available on your machine:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Node.js 18+** — required to build and run the strategy bundle locally.
+- **Docker** and **Docker Compose** — used to run PostgreSQL, Pgpool-II, and Redis.
 
-## Get started
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/tripolskypetr/backtest-kit.git
+cd backtest-kit/backtest-kit-redis-postgres-pgpool-docker
+npm install
+```
+
+---
+
+## Option A: Local Run (Host Node, Dockerized Infrastructure)
+
+Run Node.js directly on your host while PostgreSQL, Pgpool-II, and Redis run in Docker. This is the fastest way to iterate on strategy code — rebuild and restart Node without touching the containers.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Start the Pgpool-II cluster">
+    This single command boots a full cluster: one primary PostgreSQL node and two streaming replicas, all fronted by Pgpool-II on port `5432`.
 
     ```bash
-    npm install your-package
+    docker-compose -f docker/pgpool/docker-compose.yaml up -d
     ```
+
+    <Note>
+      First boot takes approximately 60–90 seconds while the replica containers clone the primary's data directory via `pg_basebackup`. Wait for both replica containers to report healthy before proceeding.
+    </Note>
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
+  <Step title="Start Redis">
     ```bash
-    your-cli init
+    docker-compose -f docker/redis/docker-compose.yaml up -d
     ```
+
+    Redis listens on `:6379` with password `mysecurepassword`. The O(1) ID cache layers on top of PostgreSQL automatically once the app connects.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Configure environment variables">
+    Copy the example environment file and review the connection strings:
 
     ```bash
-    your-cli start
+    cp .env.example .env
     ```
+
+    The defaults in `.env.example` point to the Dockerized infrastructure using `host.docker.internal`:
+
+    ```bash
+    CC_REDIS_HOST=host.docker.internal
+    CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@host.docker.internal:5432/backtest-pro
+    ```
+
+    `host.docker.internal` resolves to the host machine from inside Docker containers. If your infrastructure runs on a remote host, replace these values with the appropriate hostnames or IP addresses.
+  </Step>
+
+  <Step title="Build and run a backtest">
+    `npm run start` compiles the TypeScript strategy bundle with Rollup before launching the `@backtest-kit/cli` runner.
+
+    ```bash
+    npm run start -- --entry --backtest --ui ./build/index.cjs
+    ```
+
+    The `--entry` flag activates the strategy entry point, `--backtest` selects backtest mode, and `--ui` enables the web dashboard.
+  </Step>
+
+  <Step title="Open the web UI">
+    Once the runner reports `ready`, open your browser at:
+
+    ```
+    http://localhost:60050
+    ```
+
+    The dashboard shows live candle replay progress, open and closed signal positions, and strategy logs — all persisted to PostgreSQL and served from Redis.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+---
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+## Option B: Full Docker Deploy
+
+Bundle the strategy, runner, and `@backtest-kit/cli` into a single Docker Compose stack. Useful for CI, staging, or any environment where Node.js is not installed on the host.
+
+<Steps>
+  <Step title="Build the strategy bundle">
+    The main `docker-compose.yaml` mounts the project as `/workspace` inside the container, so the compiled bundle must exist before the container starts.
+
+    ```bash
+    npm run build
+    ```
+  </Step>
+
+  <Step title="Start everything with Docker Compose">
+    Pass the mode and entry flags as environment variables:
+
+    ```bash
+    MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+    ```
+
+    The `MODE` variable accepts `backtest`, `live`, or `paper`. `ENTRY=1` corresponds to the `--entry` CLI flag. `UI=1` enables the web dashboard on `:60050`.
+  </Step>
+
+  <Step title="Follow the logs">
+    ```bash
+    docker-compose logs -f
+    ```
+
+    Watch for the `waitForReady` and `warmCandles` log lines, which confirm that PostgreSQL and Redis connections are established and the candle data fetch has begun.
+  </Step>
+</Steps>
+
+Alternatively, use the convenience npm scripts that set the environment variables for you:
+
+```bash
+# Start in backtest mode (builds first, then docker-compose up -d)
+npm run start:docker
+
+# Tear down all containers
+npm run stop:docker
+```
+
+---
+
+## Switching Modes
+
+The same compiled bundle supports all three backtest-kit execution modes. Pass the appropriate flag to select the mode at runtime.
+
+<CodeGroup>
+
+```bash backtest
+npm run start -- --entry --backtest --ui ./build/index.cjs
+```
+
+```bash live
+npm run start -- --entry --live --ui ./build/index.cjs
+```
+
+```bash paper
+npm run start -- --entry --paper --ui ./build/index.cjs
+```
+
+</CodeGroup>
+
+In **backtest** mode the strategy replays historical candles from a configurable date range. In **live** mode it connects to a real exchange feed and writes positions to the production tables. In **paper** mode it consumes live market data but simulates order execution — identical persistence path to live, but without real orders being placed.
+
+---
+
+## What Happens on First Boot
+
+When the app connects to a fresh PostgreSQL instance, TypeORM's `synchronize: true` setting inspects the registered entity schemas and issues the necessary `CREATE TABLE` and `CREATE UNIQUE INDEX` statements automatically.
+
+<Note>
+  No manual migration step is required. All 16 tables and their compound unique indexes are created on first connect. Re-running against an existing database is safe — TypeORM only applies the diff.
+</Note>
+
+The unique index on each table (for example `(symbol, strategyName, exchangeName)` on `signal-items`) is also the **conflict target** for every atomic upsert, so the schema and the write logic stay in sync by construction.
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Layout" icon="docker" href="/infrastructure/docker-layout">
+    Understand the three Compose files (`pgpool`, `postgres`, `redis`) and the main app Compose file, including how `host.docker.internal` bridges containers to host infrastructure.
+  </Card>
+  <Card title="Environment Variables" icon="sliders" href="/infrastructure/environment-variables">
+    Full reference for every environment variable consumed by the runner container and the CLI — `MODE`, `STRATEGY_FILE`, `ENTRY`, `UI`, `TELEGRAM`, and the `CC_*` connection strings.
+  </Card>
+  <Card title="Persistence Overview" icon="database" href="/persistence/overview">
+    Deep-dive into the 16 adapt adapter architecture: how the `BaseCRUD` and `BaseMap` base classes work, the read path (Redis hit → Postgres PK lookup → cache backfill), and soft-delete tombstone semantics.
+  </Card>
+  <Card title="Atomicity" icon="shield-check" href="/persistence/atomicity">
+    Detailed explanation of the `INSERT … ON CONFLICT … DO UPDATE … RETURNING *` pattern, why a follow-up `SELECT` is never issued, and how this satisfies backtest-kit's write-durability contract across a real replica cluster.
+  </Card>
+</CardGroup>

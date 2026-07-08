@@ -1,0 +1,134 @@
+---
+title: "Persistence Layer Overview: Adapters, DB, and Cache"
+sidebarTitle: "Overview"
+description: "How the 16 backtest-kit persist adapters connect to PostgreSQL via TypeORM and Redis via BaseMap, replacing file-based storage with production-grade persistence."
+---
+
+The persistence layer in `backtest-kit-redis-postgres-pgpool-docker` is organized into three cooperating tiers: the **adapter registration layer** (`src/config/setup.ts`) wires the 16 `IPersist*Instance` implementations that backtest-kit calls; the **DB tier** (`src/lib/services/db/`) contains TypeORM services that execute atomic `INSERT … ON CONFLICT … DO UPDATE … RETURNING` statements against PostgreSQL; and the **cache tier** (`src/lib/services/cache/`) contains Redis `BaseMap` services that store each row's UUID for O(1) lookups. Strategy code, runners, and the CLI entrypoint remain entirely unchanged — only the persistence layer is swapped.
+
+## Three-tier architecture
+
+Every adapter delegates its read and write methods through this same three-tier path. The split means you can replace any tier independently: swap Redis for a different store by implementing the `BaseMap` interface, or replace the Postgres cluster by pointing `CC_POSTGRES_CONNECTION_STRING` at a different host.
+
+<CardGroup cols={3}>
+  <Card title="Adapt tier — src/config/setup.ts" icon="plug">
+    Registers all 16 `Persist*Adapter` implementations against the backtest-kit framework via `usePersist*Adapter`. This is the **only file that must change** when swapping the persistence backend. Each adapter calls `waitForInfra()` on first touch to gate all I/O on infrastructure readiness.
+  </Card>
+  <Card title="DB tier — src/lib/services/db/" icon="database">
+    TypeORM services (one per domain) that wrap a `BaseCRUD` mixin. Each service exposes `upsert` (single atomic round-trip via `INSERT … ON CONFLICT … DO UPDATE … RETURNING`) and `findByContext` (Redis-first lookup, Postgres fallback). Tables and unique indexes are created automatically on first boot via TypeORM `synchronize: true`.
+  </Card>
+  <Card title="Cache tier — src/lib/services/cache/" icon="bolt">
+    Redis `BaseMap` services (one per domain) that store only the row's UUID — never the document itself. A context key (e.g. `exchangeName:strategyName:symbol`) maps to a UUID string, making every warm read a single Redis `GET` + a Postgres primary-key lookup. TTL is `-1` (no expiry).
+  </Card>
+</CardGroup>
+
+## Adapter skeleton
+
+Every adapter follows the same four-method pattern. The `waitForInit` guard ensures that the first real I/O call blocks until both PostgreSQL and Redis are reachable; subsequent calls on the same instance skip it entirely via the `singleshot` utility.
+
+```typescript
+// Generic pattern — every Persist*Adapter in src/config/setup.ts looks like this
+PersistXAdapter.usePersistXAdapter(class implements IPersistXInstance {
+  constructor(/* context fields injected by backtest-kit */) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();        // singleshot: awaits Postgres + Redis, runs once per process
+  }
+
+  async readXData(...): Promise<XData | null> {
+    return await ioc.xDbService.findByContext(...);   // Redis hit → PK lookup, or full filter
+  }
+
+  async writeXData(data: XData, when: Date): Promise<void> {
+    await ioc.xDbService.upsert(..., data, when);    // single atomic INSERT … RETURNING
+  }
+});
+```
+
+The `when: Date` argument is present on all signal-affecting adapters (Risk, Partial, Breakeven, Recent, State, Session, Memory, Interval). It carries the logical simulation timestamp and is stored in a `bigint` column so the framework can enforce look-ahead-bias rules. See [Look-Ahead Bias](/persistence/look-ahead-bias) for details.
+
+## Service naming convention
+
+For every domain, two services are registered in the IoC container: the `*DbService` for durable storage in PostgreSQL and the `*CacheService` for O(1) lookups in Redis. They are accessed through the globally available `ioc` object.
+
+| Domain | Postgres service (`ioc.*DbService`) | Redis service (`ioc.*CacheService`) |
+|---|---|---|
+| Candle | `ioc.candleDbService` | `ioc.candleCacheService` |
+| Signal | `ioc.signalDbService` | `ioc.signalCacheService` |
+| Schedule | `ioc.scheduleDbService` | `ioc.scheduleCacheService` |
+| Strategy | `ioc.strategyDbService` | `ioc.strategyCacheService` |
+| Risk | `ioc.riskDbService` | `ioc.riskCacheService` |
+| Partial | `ioc.partialDbService` | `ioc.partialCacheService` |
+| Breakeven | `ioc.breakevenDbService` | `ioc.breakevenCacheService` |
+| Storage | `ioc.storageDbService` | `ioc.storageCacheService` |
+| Notification | `ioc.notificationDbService` | `ioc.notificationCacheService` |
+| Log | `ioc.logDbService` | `ioc.logCacheService` |
+| Measure | `ioc.measureDbService` | `ioc.measureCacheService` |
+| Interval | `ioc.intervalDbService` | `ioc.intervalCacheService` |
+| Memory | `ioc.memoryDbService` | `ioc.memoryCacheService` |
+| Recent | `ioc.recentDbService` | `ioc.recentCacheService` |
+| State | `ioc.stateDbService` | `ioc.stateCacheService` |
+| Session | `ioc.sessionDbService` | `ioc.sessionCacheService` |
+
+## TypeORM setup
+
+The `DataSource` is initialized exactly once per process via `getPostgres()`, which is wrapped in a `singleshot` call inside `PostgresService.waitForInit`. On first connection TypeORM runs `synchronize: true`, which introspects all 16 registered `EntitySchema` objects and issues `CREATE TABLE IF NOT EXISTS` and `CREATE UNIQUE INDEX IF NOT EXISTS` DDL against the primary node. There is no manual migration step — a fresh empty database becomes fully schema-ready on the first application boot.
+
+```typescript
+// src/lib/services/base/PostgresService.ts (simplified)
+public waitForInit = singleshot(async () => {
+  const result = await Promise.race([
+    getPostgres(),                            // initializes DataSource with synchronize: true
+    sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+  ]);
+  if (result === TIMEOUT_SYMBOL) {
+    this.waitForInit.clear();                 // allow retry on next call
+    throw new Error("Postgres connection timeout");
+  }
+  return result as DataSource;
+});
+```
+
+<Note>
+  `synchronize: true` is safe here because all schema definitions live in version-controlled `EntitySchema` objects. Never run `synchronize: true` against a database that has unversioned manual schema changes — TypeORM may alter or drop columns it does not recognise.
+</Note>
+
+## IoC container
+
+The `ioc` object, exported from `src/lib/index.ts`, is the single point of access to all 35 services: 3 base services (`loggerService`, `postgresService`, `redisService`), 16 DB services, and 16 cache services. It is registered on `globalThis` immediately after `init()` so that all adapter classes can import it without circular-dependency issues.
+
+```typescript
+// src/lib/index.ts
+export const ioc = {
+  ...baseServices,    // loggerService, postgresService, redisService
+  ...cacheServices,   // 16 *CacheService instances
+  ...dbServices,      // 16 *DbService instances
+};
+
+init();
+
+Object.assign(globalThis, { ioc });  // available as a global without re-import
+```
+
+Services are resolved lazily via `inject<T>(TYPES.x)` — each property getter calls into the IoC container on first access, so no service is instantiated until it is actually needed.
+
+## Infra readiness gate
+
+`waitForInfra` is a `singleshot`-wrapped async function defined once at the top of `src/config/setup.ts`. The first of the 16 adapters that receives `initial = true` triggers it; all subsequent adapter initializations await the same shared promise, so PostgreSQL and Redis are connected at most once regardless of how many adapters are registered.
+
+```typescript
+// src/config/setup.ts
+const waitForInfra = singleshot(
+  async () => {
+    await Promise.all([
+      ioc.postgresService.waitForInit(),   // connects DataSource, runs synchronize
+      ioc.redisService.waitForInit(),      // connects ioredis client
+    ]);
+  }
+);
+```
+
+<Tip>
+  The `singleshot` utility (from `functools-kit`) memoizes the return value of an async function after the first successful resolution. If the first call rejects (e.g. Postgres is temporarily unreachable), `waitForInit.clear()` inside `PostgresService` resets the memo so the next adapter initialization retries the connection.
+</Tip>

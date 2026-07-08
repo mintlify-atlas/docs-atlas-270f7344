@@ -1,0 +1,409 @@
+---
+title: "PostgreSQL Table Schemas and TypeORM Entity Definitions"
+sidebarTitle: "Schemas"
+description: "Complete reference for all 16 TypeORM EntitySchema definitions, their columns, PostgreSQL types, unique indexes, and the epochTransformer for bigint timestamps."
+---
+
+All 16 PostgreSQL tables used by `backtest-kit-redis-postgres-pgpool-docker` are defined as TypeORM `EntitySchema` objects inside `src/schema/`. When the application starts, TypeORM's `synchronize: true` option inspects the connected database and automatically creates any missing tables or indexes — no manual migrations or `CREATE TABLE` statements are required on first run.
+
+## Common Columns
+
+Every one of the 16 entity schemas shares three infrastructure columns that TypeORM manages automatically.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | Primary key. Generated server-side with `gen_random_uuid()`. |
+| `createDate` | `timestamptz` | Set once at insert time; never updated afterward. |
+| `updatedDate` | `timestamptz` | Refreshed on every write by TypeORM's `updateDate` flag. |
+
+---
+
+## epochTransformer
+
+Several columns store millisecond-precision Unix timestamps as PostgreSQL `bigint` values. The `pg` driver always deserializes `bigint` columns as JavaScript strings to avoid integer overflow, so a `ValueTransformer` is needed to convert those strings back to plain `number` values on the JavaScript side.
+
+```typescript
+// src/utils/epochTransformer.ts
+import { ValueTransformer } from "typeorm";
+
+/**
+ * Stores epoch-millisecond numbers in a Postgres `bigint` column while keeping
+ * the JS-visible value a plain `number`. The `pg` driver returns `bigint` as a
+ * string, so `from` parses it back; `to` passes the number through unchanged.
+ */
+export const epochTransformer: ValueTransformer = {
+  to: (value: number | null | undefined) => value,
+  from: (value: string | null | undefined) =>
+    value === null || value === undefined ? value : Number(value),
+};
+```
+
+Every column declared as `{ type: "bigint", transformer: epochTransformer }` in the schemas below uses this transformer. The `to` direction is a no-op (TypeORM serializes the number as-is), while `from` parses the string returned by `pg` back to a `number`.
+
+---
+
+## Schema Catalog
+
+The 16 schemas are grouped below by their functional role: **immutable market data**, **signal state** (live position tracking), **soft-delete key/value stores**, and **session & runtime state**.
+
+### Immutable Market Data
+
+#### `candle-items`
+
+Stores OHLCV price bars fetched from an exchange. Each bar is uniquely identified by its symbol, interval, and timestamp.
+
+```typescript
+// src/schema/Candle.schema.ts (columns excerpt)
+timestamp: { type: "bigint", transformer: epochTransformer },
+open:      { type: "double precision" },
+high:      { type: "double precision" },
+low:       { type: "double precision" },
+close:     { type: "double precision" },
+volume:    { type: "double precision" },
+```
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | Trading pair, e.g. `BTC/USDT` |
+| `interval` | `varchar` | `CandleInterval` enum value |
+| `timestamp` | `bigint` | Millisecond epoch — `epochTransformer` applied |
+| `exchangeName` | `varchar` | Source exchange identifier |
+| `open` | `double precision` | Opening price |
+| `high` | `double precision` | High price |
+| `low` | `double precision` | Low price |
+| `close` | `double precision` | Closing price |
+| `volume` | `double precision` | Trade volume |
+| `createDate` | `timestamptz` | Auto-set on insert |
+| `updatedDate` | `timestamptz` | Auto-updated on write |
+
+**Unique index** `candle_items_uq`: `(symbol, interval, timestamp)`
+
+---
+
+### Signal State
+
+These tables track the lifecycle of trading signals and their associated risk, partial-close, and breakeven state. Each row is keyed by a combination of symbol, strategy name, exchange name, and optionally a `signalId`.
+
+#### `signal-items`
+
+Holds the current open-signal row for each `(symbol, strategyName, exchangeName)` triplet. `payload` is the full `ISignalRow` object (nullable — cleared when no signal is active).
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `payload` | `jsonb` | `ISignalRow \| null` |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `signal_items_uq`: `(symbol, strategyName, exchangeName)`
+
+---
+
+#### `schedule-items`
+
+Same shape as `signal-items`. Stores a pending scheduled signal (`IScheduledSignalRow | null`) for each `(symbol, strategyName, exchangeName)` triplet, cleared after the schedule fires.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `payload` | `jsonb` | `IScheduledSignalRow \| null` |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `schedule_items_uq`: `(symbol, strategyName, exchangeName)`
+
+---
+
+#### `strategy-items`
+
+Persists strategy-level data (`StrategyData | null`) for each `(symbol, strategyName, exchangeName)` combination, allowing strategies to survive restarts.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `payload` | `jsonb` | `StrategyData \| null` — nullable |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `strategy_items_uq`: `(symbol, strategyName, exchangeName)`
+
+---
+
+#### `risk-items`
+
+Stores the aggregated open positions (`RiskData`) managed by a named risk controller on a specific exchange. The `when` column records the last update time.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `riskName` | `varchar` | Risk controller identifier |
+| `exchangeName` | `varchar` | |
+| `positions` | `jsonb` | `RiskData` |
+| `when` | `bigint` | Last update epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `risk_items_uq`: `(riskName, exchangeName)`
+
+---
+
+#### `partial-items`
+
+Tracks partial-close state (`PartialData`) for an individual signal, identified by its four-part key.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `signalId` | `varchar` | Unique ID of the parent signal |
+| `payload` | `jsonb` | `PartialData` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `partial_items_uq`: `(symbol, strategyName, exchangeName, signalId)`
+
+---
+
+#### `breakeven-items`
+
+Mirrors `partial-items` in structure. Stores breakeven-move state (`BreakevenData`) for a specific signal.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `signalId` | `varchar` | Unique ID of the parent signal |
+| `payload` | `jsonb` | `BreakevenData` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `breakeven_items_uq`: `(symbol, strategyName, exchangeName, signalId)`
+
+---
+
+#### `storage-items`
+
+A generic persistent signal store. Unlike `signal-items`, rows here are never cleared — they form a durable history of every signal's final serialized state (`IStorageSignalRow`). The `backtest` flag separates live and backtest namespaces.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `backtest` | `boolean` | `true` for backtest runs |
+| `signalId` | `varchar` | Unique signal identifier |
+| `payload` | `jsonb` | `IStorageSignalRow` |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `storage_items_uq`: `(backtest, signalId)`
+
+---
+
+#### `notification-items`
+
+Stores dispatched notifications (`NotificationModel`) deduplicated by `notificationId`. The `backtest` flag separates live and backtest notification namespaces.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `backtest` | `boolean` | |
+| `notificationId` | `varchar` | Deduplication key |
+| `payload` | `jsonb` | `NotificationModel` |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `notification_items_uq`: `(backtest, notificationId)`
+
+---
+
+#### `recent-items`
+
+Stores the most-recent public signal snapshot (`IPublicSignalRow`) per `(symbol, strategyName, exchangeName, frameName, backtest)` quintuple. Useful for UI dashboards that need the last known signal state without querying history.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `symbol` | `varchar` | |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `frameName` | `varchar` | Time-frame identifier |
+| `backtest` | `boolean` | |
+| `payload` | `jsonb` | `IPublicSignalRow` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `recent_items_uq`: `(symbol, strategyName, exchangeName, frameName, backtest)`
+
+---
+
+#### `log-items`
+
+An append-style log store. Each `ILogEntry` is deduplicated by `entryId`, preventing duplicate log rows on retry.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `entryId` | `varchar` | Content-addressed deduplication key |
+| `payload` | `jsonb` | `ILogEntry` |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `log_items_uq`: `(entryId)`
+
+---
+
+### Soft-Delete Key/Value Stores
+
+<Note>
+  `measure-items`, `interval-items`, and `memory-items` all include a `removed: boolean` column (default `false`). Rows are **never physically deleted**. Instead, `listKeys` filters on `removed = false`, and a logical-delete operation flips the flag to `true`. This preserves historical audit trails while keeping queries fast on the active subset.
+</Note>
+
+#### `measure-items`
+
+A key/value store for named measurements (`MeasureData`). Each row lives in a `bucket` namespace and is addressed by `entryKey`.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `bucket` | `varchar` | Namespace for the measurement |
+| `entryKey` | `varchar` | Unique key within the bucket |
+| `payload` | `jsonb` | `MeasureData` |
+| `removed` | `boolean` | Soft-delete flag, default `false` |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `measure_items_uq`: `(bucket, entryKey)`
+
+---
+
+#### `interval-items`
+
+Extends `measure-items` with a `when` timestamp. Stores time-stamped interval data (`IntervalData`) within a bucket/key namespace.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `bucket` | `varchar` | Namespace |
+| `entryKey` | `varchar` | Unique key within the bucket |
+| `payload` | `jsonb` | `IntervalData` |
+| `removed` | `boolean` | Soft-delete flag, default `false` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `interval_items_uq`: `(bucket, entryKey)`
+
+---
+
+#### `memory-items`
+
+Stores arbitrary strategy memory blobs (`MemoryData`). Each entry is addressed by a three-part key: `signalId`, `bucketName`, and `memoryId`.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `signalId` | `varchar` | Parent signal identifier |
+| `bucketName` | `varchar` | Memory namespace |
+| `memoryId` | `varchar` | Unique key within the bucket |
+| `payload` | `jsonb` | `MemoryData` |
+| `removed` | `boolean` | Soft-delete flag, default `false` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `memory_items_uq`: `(signalId, bucketName, memoryId)`
+
+---
+
+### Session and Runtime State
+
+#### `state-items`
+
+Persists the runtime state blob (`StateData`) for a signal/bucket pair. State is restored on reconnect, enabling strategies to resume exactly where they left off.
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `signalId` | `varchar` | Parent signal identifier |
+| `bucketName` | `varchar` | State namespace |
+| `payload` | `jsonb` | `StateData` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `state_items_uq`: `(signalId, bucketName)`
+
+---
+
+#### `session-items`
+
+Persists the session checkpoint (`SessionData`) for a strategy running on a specific exchange, frame, and symbol. The `backtest` flag ensures live and backtest sessions are stored independently.
+
+<Note>
+  `symbol` and `backtest` are both part of the uniqueness key. Without them, two symbols running the same strategy on the same exchange would share one record and overwrite each other's session state after a restart.
+</Note>
+
+| Column | PostgreSQL Type | Notes |
+|--------|----------------|-------|
+| `id` | `uuid` | PK, auto-generated |
+| `strategyName` | `varchar` | |
+| `exchangeName` | `varchar` | |
+| `frameName` | `varchar` | |
+| `symbol` | `varchar` | |
+| `backtest` | `boolean` | Separates live from backtest sessions |
+| `payload` | `jsonb` | `SessionData` |
+| `when` | `bigint` | Epoch ms — `epochTransformer` applied |
+| `createDate` | `timestamptz` | |
+| `updatedDate` | `timestamptz` | |
+
+**Unique index** `session_items_uq`: `(strategyName, exchangeName, frameName, symbol, backtest)`
+
+---
+
+## Auto-Synchronization
+
+<Tip>
+  TypeORM's `synchronize: true` (set in `src/config/postgres.ts`) automatically creates all 16 tables and their unique indexes the first time the application connects to a fresh database. There is nothing to run manually. For production deployments where you need precise control over schema changes, consider switching to TypeORM migrations (`synchronize: false` + `migrations: [...]`) to prevent unintended `ALTER TABLE` operations during upgrades.
+</Tip>
+
+The full entity list registered with the `DataSource` is:
+
+```typescript
+// src/config/postgres.ts
+entities: [
+  BreakevenModel,
+  CandleModel,
+  IntervalModel,
+  LogModel,
+  MeasureModel,
+  MemoryModel,
+  NotificationModel,
+  PartialModel,
+  RecentModel,
+  RiskModel,
+  ScheduleModel,
+  SessionModel,
+  SignalModel,
+  StateModel,
+  StorageModel,
+  StrategyModel,
+],
+synchronize: true,
+logging: false,
+```

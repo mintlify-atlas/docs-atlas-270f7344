@@ -1,0 +1,132 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "backtest-kit Redis + PostgreSQL + Pgpool Docker",
+  "projectDescription": "A production-grade persistence layer for backtest-kit that replaces file-based storage with PostgreSQL (TypeORM) as the source of truth and Redis as an O(1) ID cache, backed by a Pgpool-II streaming-replica cluster for safe development.",
+  "theme": "aspen",
+  "primaryColor": "#1a56db",
+  "lightColor": "#3b82f6",
+  "darkColor": "#1e3a5f",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Infrastructure",
+            "pages": [
+              "infrastructure/docker-layout",
+              "infrastructure/environment-variables",
+              "infrastructure/pgpool-cluster",
+              "infrastructure/redis-cache"
+            ]
+          },
+          {
+            "group": "Persistence Layer",
+            "pages": [
+              "persistence/overview",
+              "persistence/atomicity",
+              "persistence/adapters",
+              "persistence/look-ahead-bias"
+            ]
+          },
+          {
+            "group": "Running Modes",
+            "pages": [
+              "modes/backtest",
+              "modes/live",
+              "modes/paper"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Services",
+            "pages": [
+              "reference/ioc-container",
+              "reference/postgres-service",
+              "reference/redis-service",
+              "reference/base-crud"
+            ]
+          },
+          {
+            "group": "Database Services",
+            "pages": [
+              "reference/db-services",
+              "reference/cache-services"
+            ]
+          },
+          {
+            "group": "Schema",
+            "pages": [
+              "reference/schemas",
+              "reference/configuration"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "16 plug-in persist adapters implementing the full backtest-kit IPersist* contract on PostgreSQL + Redis",
+    "Atomic ON CONFLICT … DO UPDATE … RETURNING upserts — no read-then-write races under concurrent access",
+    "Redis O(1) ID cache in front of every PostgreSQL context-key lookup",
+    "Pgpool-II dev cluster (1 primary + 2 streaming replicas) that surfaces replication-lag bugs in development",
+    "Look-ahead bias protection via a `when: Date` epoch column on all signal-affecting tables",
+    "Soft-delete pattern for Measure, Interval, and Memory using server-side jsonb_set",
+    "TypeORM schema auto-synchronisation — no manual migrations required",
+    "Three execution modes: backtest, live, and paper trading",
+    "Single docker-compose file for the full container stack with env-file configuration"
+  ],
+  "publicApiSurface": [
+    "ioc (IoC container exporting all 35 services)",
+    "PostgresService.waitForInit()",
+    "RedisService.waitForInit()",
+    "BaseCRUD: create, update, findById, findByFilter, findAll",
+    "CandleDbService: create, hasCandle, findBySymbolIntervalTimestamp",
+    "SignalDbService: upsert, findByContext",
+    "ScheduleDbService: upsert, findByContext",
+    "StrategyDbService: upsert, findByContext",
+    "RiskDbService: upsert, findByContext",
+    "PartialDbService: upsert, findByContext",
+    "BreakevenDbService: upsert, findByContext",
+    "StorageDbService: upsert, findBySignalId, listByMode",
+    "NotificationDbService: upsert, findByNotificationId, listByMode",
+    "LogDbService: upsert, findByEntryId, listAll",
+    "MeasureDbService: upsert, findByKey, softRemove, listKeys",
+    "IntervalDbService: upsert, findByKey, softRemove, listKeys, clearBucket",
+    "MemoryDbService: upsert, findByMemoryId, hasMemoryEntry, softRemove, listEntries",
+    "RecentDbService: upsert, findByContext",
+    "StateDbService: upsert, findByContext",
+    "SessionDbService: upsert, findByContext",
+    "BaseMap: get, set, delete, has, clear, toArray, iterate, keys, values, size",
+    "PersistCandleAdapter.usePersistCandleAdapter",
+    "PersistSignalAdapter.usePersistSignalAdapter",
+    "PersistRiskAdapter.usePersistRiskAdapter",
+    "PersistScheduleAdapter.usePersistScheduleAdapter",
+    "PersistStrategyAdapter.usePersistStrategyAdapter",
+    "PersistPartialAdapter.usePersistPartialAdapter",
+    "PersistBreakevenAdapter.usePersistBreakevenAdapter",
+    "PersistStorageAdapter.usePersistStorageAdapter",
+    "PersistNotificationAdapter.usePersistNotificationAdapter",
+    "PersistLogAdapter.usePersistLogAdapter",
+    "PersistMeasureAdapter.usePersistMeasureAdapter",
+    "PersistIntervalAdapter.usePersistIntervalAdapter",
+    "PersistMemoryAdapter.usePersistMemoryAdapter",
+    "PersistRecentAdapter.usePersistRecentAdapter",
+    "PersistStateAdapter.usePersistStateAdapter",
+    "PersistSessionAdapter.usePersistSessionAdapter",
+    "CC_POSTGRES_CONNECTION_STRING (env var)",
+    "CC_REDIS_HOST, CC_REDIS_PORT, CC_REDIS_USER, CC_REDIS_PASSWORD (env vars)",
+    "MODE, ENTRY, UI, STRATEGY_FILE, SYMBOL, STRATEGY, EXCHANGE, FRAME (docker env vars)"
+  ]
+}

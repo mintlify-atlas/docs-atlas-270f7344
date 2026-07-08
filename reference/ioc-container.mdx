@@ -1,0 +1,175 @@
+---
+title: "IoC Container: Accessing All 35 Services via ioc"
+sidebarTitle: "IoC Container"
+description: "How the ioc object exposes all 35 services — base, DB, and cache — via dependency injection, and how to access individual services in strategy code."
+---
+
+The `ioc` object — exported as the default from `src/lib/index.ts` — is the single access point for every service in the persistence layer. It bundles all 35 services (3 base, 16 cache, 16 DB) into one plain JavaScript object, resolved through `di-kit` dependency injection. After the module is first imported, `ioc` is also attached to `globalThis.ioc`, so adapter code in `setup.ts` and any downstream file can reference services without an explicit re-import.
+
+## Service Categories
+
+The 35 services are organised into three groups that mirror the architecture of the persistence layer.
+
+<CardGroup cols={3}>
+  <Card title="Base Services (3)" icon="server">
+    Infrastructure primitives consumed by every other service.
+
+    - `loggerService`
+    - `postgresService`
+    - `redisService`
+  </Card>
+  <Card title="Cache Services (16)" icon="bolt">
+    Redis-backed id-lookup caches, one per domain entity.
+
+    - `candleCacheService`
+    - `signalCacheService`
+    - `scheduleCacheService`
+    - `strategyCacheService`
+    - `riskCacheService`
+    - `partialCacheService`
+    - `breakevenCacheService`
+    - `storageCacheService`
+    - `notificationCacheService`
+    - `logCacheService`
+    - `measureCacheService`
+    - `intervalCacheService`
+    - `memoryCacheService`
+    - `recentCacheService`
+    - `stateCacheService`
+    - `sessionCacheService`
+  </Card>
+  <Card title="DB Services (16)" icon="database">
+    TypeORM repository wrappers, one per domain entity.
+
+    - `candleDbService`
+    - `signalDbService`
+    - `scheduleDbService`
+    - `strategyDbService`
+    - `riskDbService`
+    - `partialDbService`
+    - `breakevenDbService`
+    - `storageDbService`
+    - `notificationDbService`
+    - `logDbService`
+    - `measureDbService`
+    - `intervalDbService`
+    - `memoryDbService`
+    - `recentDbService`
+    - `stateDbService`
+    - `sessionDbService`
+  </Card>
+</CardGroup>
+
+## Importing and Using `ioc`
+
+Import the module once at your entry point. All services are synchronously available on the returned object; infrastructure connections are initialised lazily on first use through each service's `waitForInit()` method.
+
+```typescript
+import ioc from "./lib";
+
+// Destructure for convenience
+const { postgresService, signalDbService } = ioc;
+
+// Wait for Postgres to be ready before any DB call
+await ioc.postgresService.waitForInit();
+
+// Query a domain service
+const row = await ioc.signalDbService.findByContext(
+  symbol,
+  strategyName,
+  exchangeName,
+);
+```
+
+## Global Access via `globalThis`
+
+<Note>
+  After `src/lib/index.ts` is imported for the first time, the `ioc` object is
+  also available as `globalThis.ioc`. This lets adapter implementations in
+  `setup.ts` call `ioc.postgresService`, `ioc.signalDbService`, and so on
+  without adding an import statement to every file.
+</Note>
+
+This is wired up at the bottom of `src/lib/index.ts`:
+
+```typescript
+Object.assign(globalThis, { ioc });
+```
+
+## DI Internals
+
+The container is built on three primitives produced by `createActivator("pro")` from `di-kit` (`src/lib/core/di.ts`):
+
+```typescript
+import { createActivator } from "di-kit";
+
+export const { init, inject, provide } = createActivator("pro");
+```
+
+<Steps>
+  <Step title="Registration (provide)">
+    Every service is registered in `src/lib/core/provide.ts` using `provide(token, factory)`. The factory is a zero-argument function that constructs the service instance:
+
+    ```typescript
+    provide(TYPES.loggerService,   () => new LoggerService());
+    provide(TYPES.postgresService, () => new PostgresService());
+    provide(TYPES.redisService,    () => new RedisService());
+    // … 32 more registrations
+    ```
+  </Step>
+  <Step title="Injection tokens (TYPES)">
+    Each service has a unique `Symbol` defined in `src/lib/core/types.ts`. Symbols act as type-safe injection tokens that prevent accidental token collisions:
+
+    ```typescript
+    export const TYPES = {
+      loggerService:   Symbol("loggerService"),
+      postgresService: Symbol("postgresService"),
+      redisService:    Symbol("redisService"),
+      // … 32 more symbols
+    };
+    ```
+  </Step>
+  <Step title="Resolution (inject)">
+    Each property of `ioc` is resolved with `inject<T>(token)`. Resolution is lazy: the factory runs the first time the property is accessed:
+
+    ```typescript
+    export const ioc = {
+      loggerService:   inject<LoggerService>(TYPES.loggerService),
+      postgresService: inject<PostgresService>(TYPES.postgresService),
+      // … 32 more injections
+    };
+    ```
+  </Step>
+  <Step title="Initialisation (init)">
+    `init()` is called at the end of `src/lib/index.ts`. It triggers the `protected init()` lifecycle hook defined on each service, allowing services to begin their async startup (e.g., Postgres and Redis connection attempts) in the background.
+  </Step>
+</Steps>
+
+## LoggerService
+
+Every service holds a `readonly loggerService = inject<LoggerService>(TYPES.loggerService)` field. Out of the box `LoggerService` is a no-op wrapper — all four methods (`log`, `debug`, `info`, `warn`) discard their arguments. Wire in a real logger by calling `setLogger` once at startup:
+
+```typescript
+import ioc from "./lib";
+
+ioc.loggerService.setLogger({
+  log:   (topic, ...args) => console.log(`[LOG]  ${topic}`, ...args),
+  debug: (topic, ...args) => console.debug(`[DBG]  ${topic}`, ...args),
+  info:  (topic, ...args) => console.info(`[INFO] ${topic}`, ...args),
+  warn:  (topic, ...args) => console.warn(`[WARN] ${topic}`, ...args),
+});
+```
+
+<Tip>
+  Call `setLogger` before any `waitForInit()` call so that connection and
+  initialisation messages are captured from the very start.
+</Tip>
+
+## TypeScript Types
+
+Full TypeScript types for `ioc` and every service class are exported from `types.d.ts` at the repository root. The declaration file is shipped with the package so consuming projects get complete type information without installing additional dependencies.
+
+```typescript
+import type { ioc } from "backtest-kit-redis-postgres-pgpool-docker";
+// All 35 service types are available on the ioc type.
+```

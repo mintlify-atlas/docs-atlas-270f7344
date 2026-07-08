@@ -1,0 +1,245 @@
+---
+title: "Docker Compose Layout: Infrastructure and App Containers"
+sidebarTitle: "Docker Layout"
+description: "Understand the three Docker Compose files that make up the backtest-kit stack: Pgpool-II cluster, standalone Postgres, Redis, and the main app container."
+---
+
+The repository ships four Docker Compose files, each targeting a different concern. Three live under `docker/` and provision the backing services (Pgpool-II cluster, standalone Postgres, and Redis), while the root `docker-compose.yaml` runs the application container itself. You can mix and match: spin up only the services you need on the host, then run the app locally or via Docker.
+
+## Repository File Tree
+
+```
+docker/
+  pgpool/docker-compose.yaml    # 1 primary + 2 replicas + Pgpool-II on :5432
+  postgres/docker-compose.yaml  # single postgres:16-alpine on :5432 (CI/simple)
+  redis/docker-compose.yaml     # redis:7.4.1 on :6379
+docker-compose.yaml             # main app container (tripolskypetr/backtest-kit)
+```
+
+---
+
+## Pgpool Cluster Compose
+
+The `docker/pgpool/docker-compose.yaml` is the recommended database backend for development and staging. It starts the `tripolskypetr/pgpool:latest` all-in-one image, which runs one primary PostgreSQL 16 node and two streaming replicas behind a Pgpool-II load balancer — all in a single container.
+
+```yaml
+# Runs the published all-in-one cluster image tripolskypetr/pgpool:latest —
+# 1 primary + 2 streaming replicas behind Pgpool-II on port 5432, in one
+# container. See ../../pgpool for the image source.
+#
+# Every environment variable the image understands is listed explicitly below and
+# set to the image's built-in default, so this file is self-documenting: change a
+# value here and nothing else needs touching. Cluster data is bind-mounted to
+# ./data (gitignored) so it survives restarts and is easy to inspect/wipe.
+
+services:
+  pgpool:
+    image: tripolskypetr/pgpool:latest
+    container_name: pgcluster
+    ports:
+      - "5432:5432"          # single entrypoint: writes->primary, reads->replicas
+    environment:
+      # --- application role / database (must match src/config/params.ts) ---
+      POSTGRES_USER: backtest
+      POSTGRES_PASSWORD: mysecurepassword
+      POSTGRES_DB: backtest-pro
+      # --- internal streaming-replication role ---
+      REPL_USER: replicator
+      REPL_PASSWORD: replicatorpass
+      # --- paths inside the container (image defaults; rarely changed) ---
+      PGCLUSTER_ROOT: /var/lib/pgcluster
+      PGBIN: /usr/local/bin
+    volumes:
+      # Bind-mount cluster data to a local folder (gitignored).
+      - ./data:/var/lib/pgcluster
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=mysecurepassword psql -h 127.0.0.1 -p 5432 -U backtest -d backtest-pro -tAc 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 120s     # first boot clones two replicas (~60-90s)
+    restart: always
+```
+
+Key environment variables for this compose file:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `POSTGRES_USER` | `backtest` | Application database role — must match `src/config/params.ts` |
+| `POSTGRES_PASSWORD` | `mysecurepassword` | Password for the application role |
+| `POSTGRES_DB` | `backtest-pro` | Database name the app connects to |
+| `REPL_USER` | `replicator` | Internal role used for streaming replication between nodes |
+| `REPL_PASSWORD` | `replicatorpass` | Password for the replication role |
+| `PGCLUSTER_ROOT` | `/var/lib/pgcluster` | Data directory inside the container where all node data lives |
+| `PGBIN` | `/usr/local/bin` | Directory containing the PostgreSQL binaries |
+
+<Warning>
+  **First boot is slow.** On the initial `docker-compose up`, the two replicas must perform a full base-backup clone from the primary. This typically takes **60–90 seconds**. The healthcheck is configured with a `start_period: 120s` and up to 15 retries at 10-second intervals to accommodate this. Do not assume the cluster is ready until the container reports `healthy`.
+</Warning>
+
+---
+
+## Standalone Postgres Compose
+
+The `docker/postgres/docker-compose.yaml` starts a plain `postgres:16-alpine` single node. It is useful for CI pipelines or quick local experiments where you do not need to exercise replication behaviour.
+
+```yaml
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: backtest
+      POSTGRES_PASSWORD: mysecurepassword
+      POSTGRES_DB: backtest-pro
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+    restart: always
+volumes:
+  pg_data:
+```
+
+<Warning>
+  **Replication-lag issues are invisible here.** A single-node Postgres makes every write + follow-up read appear atomic because they always hit the same process. Code that passes all tests against this setup can silently corrupt state in production when a real replica cluster is introduced. Use the Pgpool compose for any non-trivial development work.
+</Warning>
+
+---
+
+## Redis Compose
+
+The `docker/redis/docker-compose.yaml` runs `redis:7.4.1` with password authentication enforced via `--requirepass`. Data is persisted in a named volume so the cache survives container restarts, but a cold start gracefully falls back to PostgreSQL.
+
+```yaml
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7.4.1
+    container_name: redis
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=mysecurepassword
+    command: ["redis-server", "--requirepass", "mysecurepassword"]
+    volumes:
+      - ./redis_data:/data
+    restart: always
+
+volumes:
+  redis_data:
+```
+
+<Note>
+  The `REDIS_PASSWORD` environment variable is informational only — Redis itself reads the password from the `--requirepass` flag in the `command` array. Both are set to `mysecurepassword` to match the application defaults in `src/config/params.ts`.
+</Note>
+
+---
+
+## Main App Compose
+
+The root `docker-compose.yaml` runs the `tripolskypetr/backtest-kit` application container. It is designed to operate alongside the service containers started above.
+
+```yaml
+version: '3.8'
+
+services:
+  backtest:
+    image: tripolskypetr/backtest-kit
+    platform: linux/amd64
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    container_name: backtest-kit-redis-mongo-docker
+    ports:
+      - "60050:60050"
+    restart: unless-stopped
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    environment:
+      - MODE
+      - STRATEGY_FILE
+      - SYMBOL
+      - STRATEGY
+      - EXCHANGE
+      - FRAME
+      - UI
+      - TELEGRAM
+      - VERBOSE
+      - NO_CACHE
+      - NO_FLUSH
+      - ENTRY
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:60050/api/v1/health/health_check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+Notable configuration points:
+
+<CardGroup cols={2}>
+  <Card title="extra_hosts: host-gateway" icon="network-wired">
+    The `host.docker.internal:host-gateway` entry maps the special DNS name `host.docker.internal` to the Docker host's IP. This allows the app container to reach Postgres and Redis running on the host without knowing the actual IP address.
+  </Card>
+  <Card title="Volume mount: /workspace" icon="folder-open">
+    The entire project directory is mounted as `/workspace` inside the container. The compiled strategy bundle (e.g. `./build/index.cjs`) is therefore immediately visible to the running process without a rebuild.
+  </Card>
+  <Card title="Port 60050" icon="globe">
+    The web UI and the `/api/v1/health/health_check` endpoint are both served on port **60050**. Set `UI=1` in your environment to enable the full web dashboard.
+  </Card>
+  <Card title="Healthcheck" icon="heart-pulse">
+    Docker polls `http://localhost:60050/api/v1/health/health_check` every 30 seconds with a 10-second timeout and 3 retries before marking the container unhealthy.
+  </Card>
+</CardGroup>
+
+---
+
+## Networking Note
+
+<Warning>
+  **Never use `127.0.0.1` in connection strings when the app runs inside Docker.** From inside the container, `127.0.0.1` resolves to the container's own loopback interface, not the host. Use `host.docker.internal` instead — the compose file adds the necessary `/etc/hosts` entry automatically via `extra_hosts: host-gateway`.
+
+  ```
+  # .env — correct for Docker app container
+  CC_POSTGRES_CONNECTION_STRING=postgres://backtest:mysecurepassword@host.docker.internal:5432/backtest-pro
+  CC_REDIS_HOST=host.docker.internal
+  ```
+</Warning>
+
+---
+
+## Recommended Dev Workflow
+
+<Steps>
+  <Step title="Start the Pgpool cluster">
+    ```bash
+    docker-compose -f docker/pgpool/docker-compose.yaml up -d
+    ```
+    Wait ~60–90 seconds for the replicas to clone. Check readiness with:
+    ```bash
+    docker-compose -f docker/pgpool/docker-compose.yaml ps
+    ```
+  </Step>
+  <Step title="Start Redis">
+    ```bash
+    docker-compose -f docker/redis/docker-compose.yaml up -d
+    ```
+  </Step>
+  <Step title="Run the app">
+    **Option A — run Node.js directly on the host** (fastest iteration):
+    ```bash
+    cp .env.example .env   # uses 127.0.0.1 defaults, fine for host-side Node
+    node build/index.cjs
+    ```
+    **Option B — run the app container** (closest to production):
+    ```bash
+    # Ensure .env uses host.docker.internal (see .env.example)
+    docker-compose up
+    ```
+  </Step>
+</Steps>

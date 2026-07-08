@@ -1,0 +1,73 @@
+---
+title: "backtest-kit Persistence: PostgreSQL, Redis, and Pgpool-II"
+sidebarTitle: "Introduction"
+description: "Learn how backtest-kit-redis-postgres-pgpool-docker replaces file-based storage with PostgreSQL, Redis, and a Pgpool-II replica cluster for production trading."
+---
+
+`backtest-kit-redis-postgres-pgpool-docker` is a production-grade integration that replaces the default `./dump/` file-based persistence in [backtest-kit](https://github.com/tripolskypetr/backtest-kit) with **PostgreSQL** as the authoritative source of truth and **Redis** as an O(1) lookup cache, all packaged with Docker Compose for one-command deploys. The project ships **16 custom persist adapters** that implement the full `IPersist*Instance` contract on top of PostgreSQL (via TypeORM) and Redis (via ioredis). Strategy code, runners, and the CLI entrypoint remain entirely unchanged — only the persistence layer is swapped.
+
+## Architecture Overview
+
+The stack is composed of four cooperating layers, each with a clearly defined responsibility.
+
+<CardGroup cols={2}>
+  <Card title="PostgreSQL (TypeORM)" icon="database">
+    The authoritative source of truth for all trading state. TypeORM with `synchronize: true` creates all tables and unique indexes automatically on first boot. Every write is a single atomic `INSERT … ON CONFLICT … DO UPDATE … RETURNING *` statement — no read-then-write races.
+  </Card>
+  <Card title="Redis (O(1) ID Cache)" icon="bolt">
+    A `BaseMap`-backed cache layer built on ioredis. Each domain stores only the row's UUID (not the document) keyed by the context composite. During backtests where thousands of `read-by-context-key` calls occur per second, this turns O(log n) B-tree queries into O(1) lookups.
+  </Card>
+  <Card title="Pgpool-II Cluster" icon="server">
+    A real streaming replication cluster — 1 primary + 2 async replicas — exposed on a single `:5432` port. Writes are routed to the primary; reads are load-balanced across replicas. Running a genuine cluster in development catches read-after-write bugs that a single-node setup silently hides.
+  </Card>
+  <Card title="Persist Adapters (×16)" icon="plug">
+    Sixteen adapter classes wiring backtest-kit's `IPersist*Instance` interface to the DB and cache layer. Each adapter delegates reads to Redis → PostgreSQL (with cache backfill) and writes to the atomic upsert pattern, then seeds the Redis cache from the `RETURNING` row.
+  </Card>
+</CardGroup>
+
+## Why Not Just Use a Single Postgres Node?
+
+A lone PostgreSQL instance is **one process** — all concurrency is arbitrated internally by row locks and MVCC. This creates what feels like automatic atomicity: a `write` followed by a separate `SELECT` appears correct because both operations hit the very same process that just committed. It looks safe. It is not a guarantee.
+
+Add read replicas and the illusion breaks. Writes must go to the primary, but reads are load-balanced across **asynchronous** replicas that lag behind by a non-zero number of milliseconds. A `write` followed by a follow-up `SELECT` can now be routed to a replica that has not yet received the commit — the read returns a stale value, or worse, returns `relation does not exist` right after schema creation. Code that passed every test on a single node can silently corrupt state in production.
+
+This is precisely why the development environment ([`docker/pgpool`](https://github.com/tripolskypetr/backtest-kit/tree/master/backtest-kit-redis-postgres-pgpool-docker/docker/pgpool)) runs a **real cluster with two replicas** rather than a single Postgres container. Any accidental read-after-write dependency is exposed during development instead of being discovered in production. The adapters in this project never issue a follow-up `SELECT` after a write: the written row is returned in the **same statement** via `RETURNING *`, and the Redis cache is seeded directly from that result.
+
+## The 16 Persist Adapters
+
+Each adapter implements the corresponding `IPersist*Instance` interface from `backtest-kit` and is registered in `src/config/setup.ts`. The table below maps every adapter to its PostgreSQL table, the compound unique index that serves as the conflict target for atomic upserts, and the adapter's purpose.
+
+| Adapter | Table Name | Context Key (unique index) | Purpose |
+|---|---|---|---|
+| **Candle** | `candle-items` | `(symbol, interval, timestamp)` | OHLCV cache; immutable inserts |
+| **Signal** | `signal-items` | `(symbol, strategyName, exchangeName)` | Live signal state per context |
+| **Schedule** | `schedule-items` | `(symbol, strategyName, exchangeName)` | Pending scheduled signal |
+| **Strategy** | `strategy-items` | `(symbol, strategyName, exchangeName)` | Persistent strategy state |
+| **Risk** | `risk-items` | `(riskName, exchangeName)` | Active risk positions snapshot |
+| **Partial** | `partial-items` | `(symbol, strategyName, exchangeName, signalId)` | Partial profit/loss levels per signal |
+| **Breakeven** | `breakeven-items` | `(symbol, strategyName, exchangeName, signalId)` | Breakeven reached flag |
+| **Storage** | `storage-items` | `(backtest, signalId)` | Closed/opened signal log per mode |
+| **Notification** | `notification-items` | `(backtest, notificationId)` | Event notifications |
+| **Log** | `log-items` | `(entryId)` | Strategy log entries |
+| **Measure** | `measure-items` | `(bucket, entryKey)` | LLM/API response cache (soft-delete) |
+| **Interval** | `interval-items` | `(bucket, entryKey)` | Once-per-interval markers (soft-delete) |
+| **Memory** | `memory-items` | `(signalId, bucketName, memoryId)` | Per-signal memory store (soft-delete) |
+| **Recent** | `recent-items` | `(symbol, strategyName, exchangeName, frameName, backtest)` | Last public signal per context |
+| **State** | `state-items` | `(signalId, bucketName)` | Per-signal state buckets |
+| **Session** | `session-items` | `(strategyName, exchangeName, frameName, symbol, backtest)` | One session per running strategy |
+
+Adapters marked **soft-delete** (Measure, Interval, Memory) never physically remove rows. Deletes flip a `removed` column via a single server-side `jsonb_set` `UPDATE … RETURNING *` — mirroring the tombstone semantics of the default file-based persist implementations for those types.
+
+## Three Running Modes
+
+The persistence layer is mode-agnostic. The same 16 adapters serve all three `backtest-kit` execution modes:
+
+- **Backtest** — replays historical candle data against the strategy. The `backtest` column on relevant tables namespaces records so backtest runs do not pollute live data.
+- **Live** — connects to a live exchange feed; all adapter writes land in the production tables.
+- **Paper** — live market data, simulated order execution; identical persistence path to live mode.
+
+Detailed setup instructions for each mode are covered in the [Quickstart](/quickstart) guide.
+
+<Note>
+  Strategy code, runners, and the CLI entrypoint stay unchanged — only the persistence layer is swapped.
+</Note>

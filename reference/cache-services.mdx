@@ -1,0 +1,219 @@
+---
+title: "Redis Cache Services: O(1) ID Lookup via BaseMap"
+sidebarTitle: "Cache Services"
+description: "API reference for all 16 Redis cache services, the BaseMap abstraction they extend, and the key structure each service uses to namespace Redis entries."
+---
+
+Every cache service in the persistence layer extends `BaseMap(REDIS_KEY, TTL)` — a factory-produced class defined in `src/lib/common/BaseMap.ts`. Rather than caching entire documents, each service stores only the row's UUID string in Redis, then lets the DB service resolve the full record from Postgres in a targeted `findByFilter({ id })` call that always hits the primary. TTL is set to `-1` for all 16 services, meaning entries **never expire** and survive process restarts indefinitely. Cache consistency is maintained by the DB services, which call the appropriate `set*` method after every successful upsert.
+
+<Note>
+  The Redis value stored at each key is always a plain UUID string — never a serialized JSON document. Keeping payloads out of Redis reduces memory pressure and avoids cache-invalidation complexity when a JSONB payload is updated in Postgres.
+</Note>
+
+---
+
+## BaseMap — base class API
+
+All cache services inherit the following methods. `connectionKey` is the `REDIS_KEY` constant declared in each service file; it becomes the namespace prefix for every Redis key managed by that service.
+
+```typescript
+class BaseMap {
+  readonly connectionKey:    string; // REDIS_KEY prefix, e.g. "candle_cache"
+  readonly ttlExpireSeconds: number; // -1 for all production services (no expiry)
+
+  /** Prepend connectionKey to key, returning "connectionKey:key". */
+  _getItemKey(key: string): string;
+
+  /** Store value at key. Respects TTL when ttlExpireSeconds !== -1. */
+  set(key: string, value: unknown): Promise<void>;
+
+  /** Retrieve value by key. Returns null when key is null or missing. */
+  get(key: string | null): Promise<unknown | null>;
+
+  /** Delete a single key. */
+  delete(key: string): Promise<void>;
+
+  /** Return true when the key exists in Redis. */
+  has(key: string): Promise<boolean>;
+
+  /** Delete all keys matching "connectionKey:*" via cursor-based SCAN. */
+  clear(): Promise<void>;
+
+  /** Return all [key, value] pairs for this prefix as an array. */
+  toArray(): Promise<[string, unknown][]>;
+
+  /** Async iterator over [key, value] pairs, batched in groups of 100. */
+  iterate(): AsyncIterableIterator<readonly [string, unknown]>;
+
+  /** Async iterator over keys (prefix stripped). */
+  keys(): AsyncIterableIterator<string>;
+
+  /** Async iterator over values. */
+  values(): AsyncIterableIterator<unknown>;
+
+  /** Count of keys matching this service's prefix. */
+  size(): Promise<number>;
+}
+```
+
+<Note>
+  `clear()`, `iterate()`, `keys()`, `values()`, and `toArray()` all use cursor-based `SCAN` with a batch size of 100. They are safe to run against large keyspaces without blocking the Redis event loop.
+</Note>
+
+---
+
+## Redis key namespacing
+
+`BaseMap._getItemKey(key)` formats every Redis key as `{connectionKey}:{key}`. Because each service is constructed with a unique `REDIS_KEY` constant, there is zero risk of key collision between services sharing the same Redis instance — even services whose domain keys overlap structurally (e.g. both `MeasureCacheService` and `IntervalCacheService` use `{bucket}:{entryKey}`).
+
+```typescript
+// Example: CandleCacheService (connectionKey = "candle_cache")
+_getItemKey("ccxt_binance:BTCUSDT:1h:1700000000000")
+// → "candle_cache:ccxt_binance:BTCUSDT:1h:1700000000000"
+```
+
+---
+
+## Service reference table
+
+The table below lists each cache service's `REDIS_KEY` prefix, the composite key formula passed to `BaseMap`, and the three (or four) public domain methods added by the subclass.
+
+| Service | `REDIS_KEY` | Key structure | Methods |
+|---|---|---|---|
+| `CandleCacheService` | `candle_cache` | `{exchangeName}:{symbol}:{interval}:{timestamp}` | `hasCandleId`, `getCandleId`, `setCandleId` |
+| `SignalCacheService` | `signal_cache` | `{exchangeName}:{strategyName}:{symbol}` | `hasSignalId`, `getSignalId`, `setSignalId` |
+| `ScheduleCacheService` | `schedule_cache` | `{exchangeName}:{strategyName}:{symbol}` | `hasScheduleId`, `getScheduleId`, `setScheduleId` |
+| `StrategyCacheService` | `strategy_cache` | `{exchangeName}:{strategyName}:{symbol}` | `hasStrategyId`, `getStrategyId`, `setStrategyId` |
+| `RiskCacheService` | `risk_cache` | `{exchangeName}:{riskName}` | `hasRiskId`, `getRiskId`, `setRiskId` |
+| `PartialCacheService` | `partial_cache` | `{exchangeName}:{strategyName}:{symbol}:{signalId}` | `hasPartialId`, `getPartialId`, `setPartialId` |
+| `BreakevenCacheService` | `breakeven_cache` | `{exchangeName}:{strategyName}:{symbol}:{signalId}` | `hasBreakevenId`, `getBreakevenId`, `setBreakevenId` |
+| `StorageCacheService` | `storage_cache` | `{backtest}:{signalId}` | `hasStorageId`, `getStorageId`, `setStorageId` |
+| `NotificationCacheService` | `notification_cache` | `{backtest}:{notificationId}` | `hasNotificationId`, `getNotificationId`, `setNotificationId` |
+| `LogCacheService` | `log_cache` | `{entryId}` | `hasLogId`, `getLogId`, `setLogId` |
+| `MeasureCacheService` | `measure_cache` | `{bucket}:{entryKey}` | `hasMeasureId`, `getMeasureId`, `setMeasureId` |
+| `IntervalCacheService` | `interval_cache` | `{bucket}:{entryKey}` | `hasIntervalId`, `getIntervalId`, `setIntervalId`, `deleteIntervalId` |
+| `MemoryCacheService` | `memory_cache` | `{signalId}:{bucketName}:{memoryId}` | `hasMemoryEntryId`, `getMemoryEntryId`, `setMemoryEntryId` |
+| `RecentCacheService` | `recent_cache` | `{exchangeName}:{strategyName}:{symbol}:{frameName}:{backtest}` | `hasRecentId`, `getRecentId`, `setRecentId` |
+| `StateCacheService` | `state_cache` | `{signalId}:{bucketName}` | `hasStateId`, `getStateId`, `setStateId` |
+| `SessionCacheService` | `session_cache` | `{strategyName}:{exchangeName}:{frameName}:{symbol}:{backtest}` | `hasSessionId`, `getSessionId`, `setSessionId` |
+
+---
+
+## CandleCacheService — representative method signatures
+
+`CandleCacheService` is the highest-throughput service in the layer and illustrates the pattern used by all 16 services. The `set*` method accepts the full row (so it can extract both the composite key components and the UUID in one call) while `has*` and `get*` accept the individual key components.
+
+```typescript
+class CandleCacheService extends BaseMap {
+  /**
+   * Returns true when a UUID is stored for the given candle identity.
+   * Delegates to BaseMap.has(). Does not touch Postgres.
+   */
+  hasCandleId(
+    symbol:       string,
+    interval:     CandleInterval,
+    exchangeName: string,
+    timestamp:    number
+  ): Promise<boolean>;
+
+  /**
+   * Returns the UUID string for the candle row, or null on a cache miss.
+   * Callers pass this UUID to findByFilter({ id }) to load the full row.
+   */
+  getCandleId(
+    symbol:       string,
+    interval:     CandleInterval,
+    exchangeName: string,
+    timestamp:    number
+  ): Promise<string | null>;
+
+  /**
+   * Stores row.id at the key derived from (row.symbol, row.interval,
+   * row.exchangeName, row.timestamp). Returns the stored UUID.
+   * Called automatically by CandleDbService.create().
+   */
+  setCandleId(row: ICandleRow): Promise<string>;
+}
+```
+
+The internal `_cacheKey` helper — extracted directly from the source — shows exactly how Redis keys are constructed:
+
+```typescript
+// src/lib/services/cache/CandleCacheService.ts
+private _cacheKey(
+  symbol:       string,
+  interval:     CandleInterval,
+  exchangeName: string,
+  timestamp:    number
+): string {
+  return `${exchangeName}:${symbol}:${interval}:${timestamp}`;
+}
+// Combined with BaseMap._getItemKey:
+// → "candle_cache:ccxt_binance:BTCUSDT:1h:1700000000000"
+```
+
+---
+
+## Cache miss behaviour
+
+On every `find*` or `has*` call in a DB service, the lookup sequence is:
+
+1. Call the cache service's `get*` or `has*` method.
+2. **Cache hit** — use the returned UUID to call `super.findByFilter({ id })` on the Postgres primary. Return the document.
+3. **Cache miss** — fall back to `super.findByFilter({ naturalKey... })`, which queries Postgres directly.
+4. If Postgres returns a row, immediately call `set*` to backfill the cache. Subsequent reads will hit Redis.
+
+<Note>
+  The cache is never the source of truth. If a Redis key is evicted, deleted, or the Redis instance is flushed, the system degrades gracefully to full Postgres queries with automatic cache rebuild on the next hit.
+</Note>
+
+---
+
+## IntervalCacheService — extra `deleteIntervalId` method
+
+`IntervalCacheService` is the only cache service that exposes a fourth method beyond the standard `has/get/set` triad. `deleteIntervalId` is called by `IntervalDbService.clearBucket` to purge cache entries for every row in a bucket before the hard `DELETE` is issued against Postgres, keeping the Redis namespace consistent with the database state.
+
+```typescript
+class IntervalCacheService extends BaseMap {
+  hasIntervalId(bucket: string, entryKey: string): Promise<boolean>;
+  getIntervalId(bucket: string, entryKey: string): Promise<string | null>;
+  setIntervalId(row: IIntervalRow): Promise<string>;
+
+  /**
+   * Removes the Redis key for (bucket, entryKey).
+   * Called by IntervalDbService.clearBucket() before the hard DELETE.
+   * Delegates to BaseMap.delete().
+   */
+  deleteIntervalId(bucket: string, entryKey: string): Promise<void>;
+}
+```
+
+<Tip>
+  If you call `IntervalDbService.clearBucket` from application code, the corresponding Redis keys are cleaned up automatically. You do not need to call `deleteIntervalId` directly.
+</Tip>
+
+---
+
+## Accessing cache services via the IoC container
+
+Cache services are available on the same `ioc` singleton as the DB services, useful when you need to inspect or warm the cache independently of the DB layer.
+
+```typescript
+import ioc from "./lib";
+
+// Check cache directly (no Postgres query)
+const cached = await ioc.candleCacheService.hasCandleId(
+  "BTCUSDT",
+  "1h",
+  "ccxt_binance",
+  1_700_000_000_000
+);
+
+// Iterate all cached candle UUIDs (cursor-based, non-blocking)
+for await (const [key, uuid] of ioc.candleCacheService.iterate()) {
+  console.log(key, uuid);
+}
+
+// Flush all entries for a service (e.g. during a test teardown)
+await ioc.intervalCacheService.clear();
+```

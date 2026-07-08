@@ -1,0 +1,186 @@
+---
+title: "RedisService: ioredis Connection and Readiness Gate"
+sidebarTitle: "RedisService"
+description: "RedisService wraps ioredis with a 15-second connection timeout, a ready-event gate, and a 30-second keepalive ping, used by all cache services."
+---
+
+`RedisService` manages the `ioredis` connection lifecycle for the persistence layer. It exposes a single public method — `waitForInit()` — that resolves as soon as the underlying Redis client emits the `ready` event, indicating the connection is fully established and commands can be issued. All 16 cache services depend on `RedisService` and call `waitForInit()` before their first `GET`/`SET` operation.
+
+## API
+
+<ParamField body="waitForInit()" type="() => Promise<Redis>">
+  Waits for the ioredis client to reach the `ready` state and resolves with the connected `Redis` instance.
+
+  - **Singleshot** — powered by `singleshot` from `functools-kit`. The connection attempt runs at most once; all concurrent callers share the same promise.
+  - **Fast path** — if `redis.status === 'ready'` at call time, the promise resolves immediately without registering any event listeners.
+  - **15-second timeout** — if the `ready` event has not fired within `CONNECTION_TIMEOUT` (15 000 ms), the method throws `Error("Redis connection timeout")` and clears the singleshot cache so the call can be retried.
+</ParamField>
+
+## Source Code
+
+```typescript
+import { Redis } from "ioredis";
+import { singleshot, sleep } from "functools-kit";
+import { getRedis } from "../../../config/redis";
+import { inject } from "../../core/di";
+import LoggerService from "./LoggerService";
+import TYPES from "../../core/types";
+
+const CONNECTION_TIMEOUT = 15_000;
+const TIMEOUT_SYMBOL = Symbol("timeout");
+
+const waitForConnect = (redis: Redis, self: RedisService) =>
+  new Promise<void>((resolve) => {
+    redis.on("ready", () => {
+      self.loggerService.log("redisService ready");
+      resolve();
+    });
+  });
+
+export class RedisService {
+
+  readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+  public waitForInit = singleshot(async () => {
+    this.loggerService.log("redisService waitForInit");
+    const redis = await getRedis();
+    if (redis.status === "ready") {
+      return redis;
+    }
+    const result = await Promise.race([
+      waitForConnect(redis, this),
+      sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+    ]);
+    if (result === TIMEOUT_SYMBOL) {
+      this.waitForInit.clear();
+      throw new Error("Redis connection timeout");
+    }
+    return redis;
+  });
+
+  protected init = async () => {
+    this.loggerService.log("redisService init");
+    await this.waitForInit();
+  };
+}
+
+export default RedisService;
+```
+
+## Connection Configuration
+
+`getRedis()` in `src/config/redis.ts` constructs the ioredis `Redis` client. Like `getPostgres()`, it is wrapped in `singleshot` so the same client instance is reused across all cache services.
+
+```typescript
+import { singleshot } from "functools-kit";
+import { Redis } from "ioredis";
+import {
+  CC_REDIS_HOST,
+  CC_REDIS_PASSWORD,
+  CC_REDIS_PORT,
+  CC_REDIS_USER,
+} from "./params";
+
+export const getRedis = singleshot(() => {
+  const redis = new Redis({
+    host:     CC_REDIS_HOST,
+    port:     CC_REDIS_PORT,
+    username: CC_REDIS_USER,
+    password: CC_REDIS_PASSWORD,
+  });
+
+  setInterval(async () => {
+    await redis.ping();
+  }, 30_000);
+
+  process.on("SIGINT", async () => {
+    await redis.disconnect(false);
+  });
+
+  return redis;
+});
+```
+
+### Connection Parameters
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `CC_REDIS_HOST` | `"127.0.0.1"` | Redis server hostname or IP |
+| `CC_REDIS_PORT` | `6379` | Redis server port |
+| `CC_REDIS_USER` | `"default"` | Redis ACL username |
+| `CC_REDIS_PASSWORD` | `"mysecurepassword"` | Redis ACL password |
+
+<Note>
+  All four variables are read from `src/config/params.ts`. Override them in
+  your deployment environment to point at a Redis Sentinel, Redis Cluster, or a
+  managed Redis service.
+</Note>
+
+## Ready Detection
+
+`waitForInit()` applies a two-branch check to avoid attaching a redundant event listener when the client is already healthy:
+
+<Steps>
+  <Step title="Immediate fast path">
+    After `getRedis()` returns the client instance, `redis.status` is checked synchronously. If it equals `'ready'`, the promise resolves immediately:
+
+    ```typescript
+    const redis = await getRedis();
+    if (redis.status === "ready") {
+      return redis; // no event listener needed
+    }
+    ```
+  </Step>
+  <Step title="Event-based wait with timeout">
+    Otherwise, a `Promise.race` runs between the `ready`-event listener and a 15-second sleep sentinel:
+
+    ```typescript
+    const result = await Promise.race([
+      waitForConnect(redis, this),
+      sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+    ]);
+    ```
+  </Step>
+  <Step title="Timeout handling">
+    If the sentinel wins the race, the singleshot cache is cleared and an error is thrown, allowing a retry:
+
+    ```typescript
+    if (result === TIMEOUT_SYMBOL) {
+      this.waitForInit.clear();
+      throw new Error("Redis connection timeout");
+    }
+    ```
+  </Step>
+</Steps>
+
+## Keepalive Ping
+
+A `setInterval` inside `getRedis()` issues a `PING` command every 30 seconds. This keeps the TCP connection alive through firewalls and load balancers that would otherwise drop idle connections:
+
+```typescript
+setInterval(async () => {
+  await redis.ping();
+}, 30_000);
+```
+
+<Tip>
+  The keepalive interval is started when the `Redis` object is first
+  constructed, before the `ready` event fires. ioredis automatically queues the
+  `PING` commands and flushes them once the connection is established.
+</Tip>
+
+## Graceful Shutdown
+
+When the Node.js process receives `SIGINT`, the Redis connection is disconnected cleanly. The `false` argument to `disconnect()` tells ioredis to wait for pending commands to complete before closing the socket:
+
+```typescript
+process.on("SIGINT", async () => {
+  await redis.disconnect(false);
+});
+```
+
+<Warning>
+  If the process is killed with `SIGKILL` instead of `SIGINT`, the keepalive
+  interval and graceful disconnect will not run. Use a process supervisor (e.g.,
+  Docker, PM2) that sends `SIGTERM`/`SIGINT` to ensure clean teardown.
+</Warning>

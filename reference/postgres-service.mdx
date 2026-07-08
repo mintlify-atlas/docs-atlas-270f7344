@@ -1,0 +1,205 @@
+---
+title: "PostgresService: TypeORM DataSource Initialization"
+sidebarTitle: "PostgresService"
+description: "PostgresService initializes a TypeORM DataSource with a 15-second connection timeout and exposes waitForInit() used by all persist adapters."
+---
+
+`PostgresService` manages the full TypeORM `DataSource` lifecycle for the persistence layer. It exposes a single public method — `waitForInit()` — that all 16 DB services and every persist adapter call before issuing their first query. The method is idempotent: the connection is established at most once regardless of how many callers race to invoke it.
+
+## API
+
+<ParamField body="waitForInit()" type="() => Promise<DataSource>">
+  Initialises the TypeORM `DataSource` and resolves with the connected instance.
+
+  - **Singleshot** — powered by `singleshot` from `functools-kit`. The underlying `Promise` is created exactly once; all subsequent callers receive the same promise.
+  - **15-second timeout** — if the database is not reachable within `CONNECTION_TIMEOUT` (15 000 ms), the method throws `Error("Postgres connection timeout")` and clears the singleshot cache so the call can be retried.
+  - **Idempotent** — once connected, every call returns the already-resolved `DataSource` with zero overhead.
+</ParamField>
+
+## Source Code
+
+```typescript
+import { DataSource } from "typeorm";
+import { singleshot, sleep } from "functools-kit";
+import { getPostgres } from "../../../config/postgres";
+import { inject } from "../../core/di";
+import LoggerService from "./LoggerService";
+import TYPES from "../../core/types";
+
+const CONNECTION_TIMEOUT = 15_000;
+const TIMEOUT_SYMBOL = Symbol("timeout");
+
+export class PostgresService {
+
+  readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+  public waitForInit = singleshot(async () => {
+    this.loggerService.log("postgresService waitForInit");
+    const result = await Promise.race([
+      getPostgres(),
+      sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+    ]);
+    if (result === TIMEOUT_SYMBOL) {
+      this.waitForInit.clear();
+      throw new Error("Postgres connection timeout");
+    }
+    this.loggerService.log("postgresService connected to the database");
+    return result as DataSource;
+  });
+
+  protected init = async () => {
+    this.loggerService.log("postgresService init");
+    await this.waitForInit();
+  };
+}
+
+export default PostgresService;
+```
+
+## DataSource Configuration
+
+`getPostgres()` in `src/config/postgres.ts` constructs and initialises the TypeORM `DataSource`. It is also wrapped in `singleshot` so the `DataSource` object is a true singleton even if the function is called from multiple DB services concurrently.
+
+```typescript
+import { singleshot } from "functools-kit";
+import { DataSource } from "typeorm";
+import { CC_POSTGRES_CONNECTION_STRING } from "./params";
+
+import { BreakevenModel } from "../schema/Breakeven.schema";
+import { CandleModel }    from "../schema/Candle.schema";
+import { IntervalModel }  from "../schema/Interval.schema";
+import { LogModel }       from "../schema/Log.schema";
+import { MeasureModel }   from "../schema/Measure.schema";
+import { MemoryModel }    from "../schema/Memory.schema";
+import { NotificationModel } from "../schema/Notification.schema";
+import { PartialModel }   from "../schema/Partial.schema";
+import { RecentModel }    from "../schema/Recent.schema";
+import { RiskModel }      from "../schema/Risk.schema";
+import { ScheduleModel }  from "../schema/Schedule.schema";
+import { SessionModel }   from "../schema/Session.schema";
+import { SignalModel }    from "../schema/Signal.schema";
+import { StateModel }     from "../schema/State.schema";
+import { StorageModel }   from "../schema/Storage.schema";
+import { StrategyModel }  from "../schema/Strategy.schema";
+
+export const getPostgres = singleshot(async () => {
+  const dataSource = new DataSource({
+    type: "postgres",
+    url: CC_POSTGRES_CONNECTION_STRING,
+    entities: [
+      BreakevenModel, CandleModel,   IntervalModel, LogModel,
+      MeasureModel,   MemoryModel,   NotificationModel, PartialModel,
+      RecentModel,    RiskModel,     ScheduleModel, SessionModel,
+      SignalModel,    StateModel,    StorageModel,  StrategyModel,
+    ],
+    synchronize: true,
+    logging: false,
+  });
+
+  await dataSource.initialize();
+
+  process.on("SIGINT", async () => {
+    await dataSource.destroy();
+  });
+
+  return dataSource;
+});
+```
+
+Key configuration details:
+
+| Option | Value | Notes |
+|---|---|---|
+| `type` | `"postgres"` | TypeORM driver |
+| `url` | `CC_POSTGRES_CONNECTION_STRING` | Full connection string env var |
+| `entities` | All 16 `EntitySchema` models | Auto-registered at startup |
+| `synchronize` | `true` | Creates tables and unique indexes automatically |
+| `logging` | `false` | Query logging disabled in production |
+
+<Warning>
+  `synchronize: true` runs schema-diff DDL on every process start. This is safe
+  for the append-only schemas used by backtest-kit but should be reviewed before
+  connecting to a shared database with external consumers.
+</Warning>
+
+## Connection Timeout
+
+The timeout is implemented with a `Promise.race` between `getPostgres()` (which calls `dataSource.initialize()`) and a `sleep(15_000)` sentinel:
+
+```typescript
+const CONNECTION_TIMEOUT = 15_000; // milliseconds
+const TIMEOUT_SYMBOL = Symbol("timeout");
+
+const result = await Promise.race([
+  getPostgres(),
+  sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+]);
+
+if (result === TIMEOUT_SYMBOL) {
+  this.waitForInit.clear(); // allow retry on next call
+  throw new Error("Postgres connection timeout");
+}
+```
+
+<Note>
+  `this.waitForInit.clear()` resets the singleshot cache so that the next call
+  to `waitForInit()` will attempt a fresh connection instead of re-throwing the
+  cached rejection.
+</Note>
+
+## Graceful Shutdown
+
+When the Node.js process receives `SIGINT`, the `DataSource` is destroyed cleanly. This is registered inside `getPostgres()`:
+
+```typescript
+process.on("SIGINT", async () => {
+  await dataSource.destroy();
+});
+```
+
+All open connections in the connection pool are released and no in-flight queries are abandoned mid-execution.
+
+## Usage in Adapters: `waitForInfra` Pattern
+
+Every persist adapter in `setup.ts` gates its first operation behind a shared `waitForInfra()` singleshot that awaits both infrastructure services in parallel:
+
+```typescript
+import ioc from "../lib";
+import { singleshot } from "functools-kit";
+
+const waitForInfra = singleshot(
+  async () => {
+    await Promise.all([
+      ioc.postgresService.waitForInit(),
+      ioc.redisService.waitForInit(),
+    ]);
+  }
+);
+
+// Inside each PersistXxxAdapter.waitForInit(initial):
+async waitForInit(initial: boolean) {
+  if (!initial) {
+    return;
+  }
+  await waitForInfra();
+}
+```
+
+<Tip>
+  Because both `postgresService.waitForInit()` and `redisService.waitForInit()`
+  are individually singled-shot, running them in `Promise.all` is safe even if
+  multiple adapters call `waitForInfra()` concurrently — each underlying
+  connection is established at most once.
+</Tip>
+
+## Connection String
+
+The connection string is read from the `CC_POSTGRES_CONNECTION_STRING` environment variable and falls back to a local default:
+
+```typescript
+export const CC_POSTGRES_CONNECTION_STRING =
+  process.env.CC_POSTGRES_CONNECTION_STRING ||
+  "postgres://backtest:mysecurepassword@localhost:5432/backtest-pro";
+```
+
+Set this variable in your deployment environment to point at a PgBouncer / Pgpool-II proxy or directly at the primary PostgreSQL instance.

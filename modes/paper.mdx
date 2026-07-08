@@ -1,0 +1,131 @@
+---
+title: "Paper Trading Mode: Simulated Live Execution"
+sidebarTitle: "Paper Mode"
+description: "How paper mode runs the strategy against live market data with simulated order execution, using the same PostgreSQL persistence as live mode."
+---
+
+Paper mode runs `Live.background()` against real market data arriving from the exchange but simulates all order execution — no real trades are placed and no exchange credentials need order-signing permissions. It shares the same entry structure as live mode, with `src/main/paper.ts` being the entry point, but is activated with the `--paper` flag instead of `--live`. This makes paper mode the ideal final validation step before committing a strategy to live trading: the strategy logic, persistence layer, and candle feed are all production-grade and real, while the risk is zero.
+
+## Entry Point
+
+The full source of `src/main/paper.ts` is shown below. It is structurally identical to `live.ts` — same imports, same initialization order, same `Live.background()` call — differing only in the flag it checks: `values.paper` instead of `values.live`.
+
+```typescript
+// src/main/paper.ts
+import { getArgs } from "../helpers/getArgs";
+import ioc from "../lib";
+import { Live, waitForReady } from "backtest-kit";
+import { ExchangeName } from "../enum/ExchangeName";
+import { StrategyName } from "../enum/StrategyName";
+
+const main = async () => {
+
+  const { values } = getArgs();
+
+  if (!values.entry) {
+    return;
+  }
+
+  if (!values.paper) {
+    return;
+  }
+
+  {
+    await ioc.postgresService.waitForInit();
+    await ioc.redisService.waitForInit();
+  }
+
+  await waitForReady(false);
+
+  Live.background("TRXUSDT", {
+    exchangeName: ExchangeName.CCXT,
+    strategyName: StrategyName.Jan2026Strategy,
+  });
+};
+
+main();
+```
+
+The simulated order execution is handled entirely inside `Live.background()` based on the `backtest` flag set by `waitForReady(false)` — paper mode passes `false` (live context) so candles are fetched from the exchange in real-time, but the order routing layer intercepts fills and simulates them without forwarding to the exchange.
+
+## Backtest vs Live vs Paper: Full Comparison
+
+The table below captures every meaningful difference across all three modes. The persistence layer, strategy code, and exchange schema registration are identical in all three.
+
+| Aspect | Backtest | Live | Paper |
+|--------|----------|------|-------|
+| CLI flag | `--backtest` | `--live` | `--paper` |
+| `MODE` env var | `backtest` | `live` | `paper` |
+| Data source | PostgreSQL candles | Live exchange | Live exchange |
+| Order execution | Simulated | **Real** | Simulated |
+| `waitForReady` param | `true` | `false` | `false` |
+| `backtest` in adapters | `true` | `false` | `false` |
+| `warmCandles` call | Required | No | No |
+| Frame required | Yes (`frameName`) | No | No |
+| Entry function | `Backtest.background()` | `Live.background()` | `Live.background()` |
+| Exchange credentials | Read-only (OHLCV only) | Full (order signing) | Read-only (OHLCV only) |
+
+## Running Paper Mode
+
+```bash
+# Local Node process, dockerized Postgres + Redis + PgPool
+npm run start -- --entry --paper --ui ./build/index.cjs
+
+# Full Docker Compose (all services including Node)
+MODE=paper ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+```
+
+As with live mode, `STRATEGY_FILE` must point to the compiled bundle that registers `addStrategySchema` for the strategy name referenced in `Live.background()`. The `--ui` flag loads this bundle before the signal loop begins.
+
+## Initialization Sequence
+
+<Steps>
+  <Step title="CLI flags checked">
+    `getArgs()` returns early unless both `--entry` and `--paper` are set. The three mode flags (`--backtest`, `--live`, `--paper`) are independent booleans, so only one mode activates per process invocation.
+  </Step>
+  <Step title="postgresService.waitForInit()">
+    Opens the PostgreSQL connection pool through PgBouncer/PgPool with a 15-second timeout. Paper records will be written to the same tables as live records, partitioned by the `backtest=false` context key value.
+  </Step>
+  <Step title="redisService.waitForInit()">
+    Connects to Redis for the candle cache layer. Candles fetched from the live exchange during paper trading are cached in Redis to reduce API round-trips on subsequent ticks.
+  </Step>
+  <Step title="waitForReady(false)">
+    Sets the runtime to non-backtest (live-context) mode. Paper mode passes `false` here — identical to live mode — because candles are sourced from the real exchange and time progresses in wall-clock order.
+  </Step>
+  <Step title="Live.background()">
+    Starts the signal loop. On each candle close, the strategy's `getSignal` is invoked with real-time price data. Any resulting positions are simulated: fills are calculated internally without placing orders on the exchange.
+  </Step>
+</Steps>
+
+## Persistence in Paper Mode
+
+Paper mode uses the same adapter stack as live mode. All 16 backtest-kit adapters write to PostgreSQL identically — simulated positions, signals, notifications, and session state all persist and are queryable after the fact.
+
+Because `waitForReady(false)` is used, the `backtest` boolean in adapter context keys is `false`, placing paper records in the same partition as live records:
+
+| Adapter group | `backtest` key value | Shared with |
+|--------------|---------------------|-------------|
+| Storage | `false` | Live records |
+| Notification | `false` | Live records |
+| Session | `false` | Live records |
+| Recent | `false` | Live records |
+
+This means paper and live records coexist in the `backtest=false` partition. If you run paper and live modes against the same database simultaneously, use a different symbol or add a secondary discriminator at the query level to distinguish them.
+
+<Tip>
+  Use paper mode to validate strategy behavior against live market conditions before switching to live mode. A paper run over several days of real market data gives you execution timing, slippage simulation, and persistence correctness that backtest mode — operating on pre-warmed historical candles — cannot fully replicate.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Persistence Overview" icon="database" href="/persistence/overview">
+    How PostgreSQL, Redis, and PgPool are wired together to back all 16 adapters across every mode.
+  </Card>
+  <Card title="Atomicity" icon="shield-check" href="/persistence/atomicity">
+    How the adapter layer uses transactions and Redis pub/sub to guarantee consistent state across concurrent candle ticks.
+  </Card>
+  <Card title="Adapters" icon="plug" href="/persistence/adapters">
+    The full catalogue of adapter schemas — Storage, Notification, Session, Recent, and more.
+  </Card>
+</CardGroup>

@@ -1,0 +1,179 @@
+---
+title: "Look-Ahead Bias Protection with the when: Date Column"
+sidebarTitle: "Look-Ahead Bias"
+description: "How backtest-kit 9.0+ uses a logical simulation timestamp in the when column to prevent future-data leakage across signal-affecting persist adapters."
+---
+
+backtest-kit 9.0+ added a `when: Date` argument to every adapter `write*` method, and to `read*` for adapters that directly affect signal logic (Risk, Partial, Breakeven). This argument carries the **logical simulation timestamp** at which the write occurs — the bar timestamp being replayed during a backtest, or the wall-clock time during live/paper trading. It is stored in a `when bigint` column (milliseconds since Unix epoch) so the framework can enforce that no `read*` call returns a value that was written in the future relative to the current simulation time, eliminating look-ahead bias at the persistence layer.
+
+## Which adapters carry `when`?
+
+Eight adapters write and store the `when` timestamp. Eight do not.
+
+<CardGroup cols={2}>
+  <Card title="Carry when: Date" icon="clock">
+    **Risk**, **Partial**, **Breakeven**, **Recent**, **State**, **Session**, **Memory**, **Interval**
+
+    These adapters store signal-affecting state that must be temporally consistent with the simulation timeline. The `when` column is declared as `bigint` with `epochTransformer` in each entity schema.
+  </Card>
+  <Card title="No when column" icon="minus-circle">
+    **Candle**, **Signal**, **Strategy**, **Schedule**, **Storage**, **Notification**, **Log**, **Measure**
+
+    These adapters either store immutable market data (Candle), pure bookkeeping state (Storage, Notification, Log), or domain data where temporal consistency is not enforced at the persistence layer (Signal, Strategy, Schedule). Measure is intentionally exempt — see the note below.
+  </Card>
+</CardGroup>
+
+## Schema example
+
+The `State` entity schema is representative of all eight `when`-carrying schemas. The `when` column is declared as `bigint` with the shared `epochTransformer` value transformer. The `createDate` and `updatedDate` columns use PostgreSQL `timestamptz` and are managed automatically by TypeORM — they are wall-clock timestamps for auditing, not simulation time.
+
+```typescript
+// src/schema/State.schema.ts
+import { EntitySchema } from "typeorm";
+import { StateData } from "backtest-kit";
+import { epochTransformer } from "../utils/epochTransformer";
+
+interface IStateDto {
+  signalId: string;
+  bucketName: string;
+  payload: StateData;
+  when: number;          // epoch milliseconds; JS-visible as number
+}
+
+interface IStateRow extends IStateDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const StateModel = new EntitySchema<IStateRow>({
+  name: "state-items",
+  columns: {
+    id: { type: "uuid", primary: true, generated: "uuid" },
+    signalId: { type: String },
+    bucketName: { type: String },
+    payload: { type: "jsonb" },
+    when: { type: "bigint", transformer: epochTransformer },   // stored as bigint, read back as number
+    createDate: { type: "timestamptz", createDate: true },
+    updatedDate: { type: "timestamptz", updateDate: true },
+  },
+  indices: [
+    { name: "state_items_uq", columns: ["signalId", "bucketName"], unique: true },
+  ],
+});
+```
+
+## epochTransformer
+
+PostgreSQL's `bigint` type is returned by the `pg` driver as a JavaScript string, because JavaScript's `Number` type cannot safely represent all 64-bit integer values. A shared `ValueTransformer` bridges the gap: `to` passes the number through unchanged on write; `from` calls `Number(value)` on read to restore a plain JS number.
+
+```typescript
+// src/utils/epochTransformer.ts
+import { ValueTransformer } from "typeorm";
+
+/**
+ * Stores epoch-millisecond numbers in a Postgres `bigint` column while keeping
+ * the JS-visible value a plain `number`. The `pg` driver returns `bigint` as a
+ * string, so `from` parses it back; `to` passes the number through unchanged.
+ */
+export const epochTransformer: ValueTransformer = {
+  to: (value: number | null | undefined) => value,
+  from: (value: string | null | undefined) =>
+    value === null || value === undefined ? value : Number(value),
+};
+```
+
+All eight `when`-carrying schemas (`State`, `Session`, `Recent`, `Risk`, `Partial`, `Breakeven`, `Interval`, `Memory`) import and apply `epochTransformer` to their `when` column. The `Candle` schema applies the same transformer to its `timestamp` column, since candle timestamps are also stored as epoch milliseconds.
+
+## How it's written
+
+The DbService converts the incoming `Date` to epoch milliseconds via `when.getTime()` inside the same atomic upsert that writes the payload. The `when` column is included in the `orUpdate` list so that subsequent writes to the same context key also update the simulation timestamp:
+
+```typescript
+// src/lib/services/db/StateDbService.ts
+public upsert = async (
+  signalId: string,
+  bucketName: string,
+  payload: StateData,
+  when: Date,
+): Promise<void> => {
+  const repo = await this.repo<IStateRow>();
+  const { raw } = await repo
+    .createQueryBuilder()
+    .insert()
+    .values({ signalId, bucketName, payload, when: when.getTime() })
+    .orUpdate(["payload", "when"], ["signalId", "bucketName"])   // both payload and when updated
+    .returning("*")
+    .execute();
+  const result = raw[0] as IStateRow;
+  await this.stateCacheService.setStateId(result);               // Redis seeded with full row id
+};
+```
+
+The `when` value written to Postgres is always `when.getTime()` — a plain `number` (milliseconds since epoch). On read, `epochTransformer.from` converts the `pg` string back to a `number`, so callers always receive a numeric timestamp regardless of Postgres's internal type representation.
+
+## Candle adapter and time-ordered reconstruction
+
+The Candle adapter does not store a `when` column for look-ahead purposes, but it enforces temporal order through its `readCandlesData` implementation. The method reconstructs the requested window by iterating `limit` slots starting at `sinceTimestamp` with steps of `INTERVAL_MINUTES[interval] * 60_000` milliseconds:
+
+```typescript
+// src/config/setup.ts — PersistCandleAdapter readCandlesData
+async readCandlesData(limit: number, sinceTimestamp: number) {
+  const stepMs = INTERVAL_MINUTES[this.interval] * MS_PER_MINUTE;
+  const result: CandleData[] = [];
+  for (let i = 0; i < limit; i++) {
+    const ts = sinceTimestamp + i * stepMs;
+    const row = await ioc.candleDbService.findBySymbolIntervalTimestamp(
+      this.symbol, this.interval, ts,
+    );
+    if (!row) {
+      return null;    // any missing slot → caller must re-fetch from exchange
+    }
+    result.push({
+      timestamp: row.timestamp,
+      open: row.open, high: row.high, low: row.low,
+      close: row.close, volume: row.volume,
+    });
+  }
+  return result;
+}
+```
+
+If any slot in the requested window is absent from Postgres, `readCandlesData` returns `null`. The backtest engine treats `null` as a cache miss and fetches the window from the exchange, then calls `writeCandlesData` to populate the missing slots. This ensures the framework never silently returns a partial window — which would itself be a form of look-ahead bias if the trailing slots were from a future bar.
+
+## Measure exemption
+
+<Note>
+  **Measure is intentionally exempt from the `when` column.** The Measure adapter caches LLM and external API responses by `(bucket, entryKey)`. These calls are made during live strategy execution, not historical simulation — the response is a function of the prompt, not of the bar timestamp. Including `when` would add no temporal constraint and would prevent cache sharing across backtest runs replaying the same date range. The `Measure.schema.ts` entity has no `when` column, and `IMeasureDto` has no `when` field.
+</Note>
+
+## Soft-delete adapters and `when`
+
+Both `Interval` and `Memory` carry `when` to record the simulation timestamp at which a key was created or last updated. The `softRemove` path does not update `when` — a tombstone records the timestamp of the last *live* write, not the time of removal. This preserves the original write timestamp for auditing and for the framework's temporal consistency checks. The `jsonb_set` soft-delete statement updates only `removed` and `payload.removed`:
+
+```typescript
+// src/lib/services/db/IntervalDbService.ts — softRemove
+.set({
+  removed: true,
+  payload: () => `jsonb_set("payload", '{removed}', 'true')`,  // when is NOT updated
+})
+.where({ bucket, entryKey })
+.returning("*")
+```
+
+The `listKeys` and `listEntries` queries filter on `removed = false`, so tombstoned rows are invisible to normal read paths while remaining available for auditing via direct Postgres queries.
+
+## Session uniqueness and look-ahead safety
+
+The `Session` schema includes both `symbol` and `backtest` in its unique index. Without `symbol`, two symbols running the same strategy on the same exchange and frame would share a single session record. After a restart, one symbol's session restore would overwrite the other's, corrupting the resumed state. The `when` column on Session records the simulation timestamp of the last `writeSessionData` call, enabling the framework to detect stale session restores when replaying historical data.
+
+```typescript
+// src/schema/Session.schema.ts
+indices: [
+  {
+    name: "session_items_uq",
+    columns: ["strategyName", "exchangeName", "frameName", "symbol", "backtest"],
+    unique: true,
+  },
+],
+```

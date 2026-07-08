@@ -1,72 +1,91 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "backtest-kit Redis + PostgreSQL + Pgpool",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#1a56db",
+    "light": "#3b82f6",
+    "dark": "#1e3a5f"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/backtest-kit/backtest-kit-redis-postgres-pgpool-docker"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/backtest-kit/backtest-kit-redis-postgres-pgpool-docker"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Infrastructure",
+            "pages": [
+              "infrastructure/docker-layout",
+              "infrastructure/environment-variables",
+              "infrastructure/pgpool-cluster",
+              "infrastructure/redis-cache"
+            ]
+          },
+          {
+            "group": "Persistence Layer",
+            "pages": [
+              "persistence/overview",
+              "persistence/atomicity",
+              "persistence/adapters",
+              "persistence/look-ahead-bias"
+            ]
+          },
+          {
+            "group": "Running Modes",
+            "pages": [
+              "modes/backtest",
+              "modes/live",
+              "modes/paper"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Services",
+            "pages": [
+              "reference/ioc-container",
+              "reference/postgres-service",
+              "reference/redis-service",
+              "reference/base-crud"
+            ]
+          },
+          {
+            "group": "Database Services",
+            "pages": [
+              "reference/db-services",
+              "reference/cache-services"
+            ]
+          },
+          {
+            "group": "Schema",
+            "pages": [
+              "reference/schemas",
+              "reference/configuration"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

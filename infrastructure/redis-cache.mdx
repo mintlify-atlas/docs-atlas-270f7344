@@ -1,0 +1,204 @@
+---
+title: "Redis as an O(1) ID Cache for backtest-kit Lookups"
+sidebarTitle: "Redis Cache"
+description: "How Redis acts as an O(1) ID cache in front of PostgreSQL, the BaseMap abstraction, the read path, and how the cache stays consistent after writes."
+---
+
+During a backtest, the persistence layer performs thousands of context-key lookups per second — finding the UUID of an existing candle row, a session record, or a risk entry so it can issue a targeted `UPDATE` rather than a full-table `SELECT`. PostgreSQL B-tree lookups on indexed compound keys are already fast at O(log n), but Redis turns each lookup into an O(1) hash `GET` that never touches the database at all in the steady state. The result is a persistence layer that keeps up with real-time tick data without saturating Postgres I/O.
+
+---
+
+## Starting Redis
+
+```bash
+docker-compose -f docker/redis/docker-compose.yaml up -d
+```
+
+The container runs `redis:7.4.1` with `--requirepass mysecurepassword` and exposes port **6379**. Data is persisted in a named Docker volume (`redis_data`), so the cache survives container restarts. If the volume is lost, the application automatically falls back to PostgreSQL and warms the cache back up on the next read cycle.
+
+Default connection details when using the bundled compose file:
+
+| Setting | Value |
+|---|---|
+| Host | `host.docker.internal` (Docker) / `127.0.0.1` (local Node) |
+| Port | `6379` |
+| Password | `mysecurepassword` |
+
+---
+
+## The `BaseMap` Abstraction
+
+Every cache service in the application extends `BaseMap(REDIS_KEY, TTL)`, defined in `src/lib/common/BaseMap.ts`. `BaseMap` is a thin, factory-produced wrapper around `ioredis` that exposes a familiar string-keyed map API while transparently handling key namespacing, TTL expiry, and cursor-based `SCAN` iteration over large key spaces.
+
+The constructor accepts two arguments:
+
+- **`connectionKey`** — a string prefix that namespaces all keys owned by this cache instance (e.g. `"candle_cache"`). Every Redis key is stored as `{connectionKey}:{userKey}`.
+- **`ttlExpireSeconds`** — seconds until a key expires. Pass `-1` to disable expiry (the default for all production cache services).
+
+### API Reference
+
+| Method | Description |
+|---|---|
+| `get(key)` | Returns the stored value for `key`, or `null` if absent. |
+| `set(key, value)` | Stores `value` under `key`. Applies TTL if configured. |
+| `delete(key)` | Removes `key` from Redis. |
+| `has(key)` | Returns `true` if the key exists in Redis. |
+| `clear()` | Removes all keys matching `{connectionKey}:*` using a cursor `SCAN` loop. |
+| `toArray()` | Returns all `[key, value]` pairs for this namespace as an array. |
+| `iterate()` | Async generator yielding `[key, value]` pairs in batches of 100. |
+| `keys()` | Async generator yielding all key strings for this namespace. |
+| `values()` | Async generator yielding all stored values for this namespace. |
+| `size()` | Returns the total count of keys in this namespace. |
+
+Bulk operations (`toArray`, `iterate`, `keys`, `values`, `size`) use Redis `SCAN` with a batch size of 100, avoiding the blocking `KEYS` command that would stall the server on large datasets.
+
+---
+
+## The Pattern: Store Only the UUID
+
+Cache services do not store full document payloads. They store only the **UUID primary key** of the corresponding PostgreSQL row. This keeps each Redis value small (a 36-character UUID string), maximises memory efficiency, and ensures the cache never holds stale field data — the authoritative record always lives in Postgres.
+
+`CandleCacheService` is the canonical example:
+
+```typescript
+// src/lib/services/cache/CandleCacheService.ts
+
+const REDIS_KEY = "candle_cache";
+
+export class CandleCacheService extends BaseMap(REDIS_KEY, -1) {
+
+  // Composite context key: exchange:symbol:interval:timestamp
+  private _cacheKey(
+    symbol: string,
+    interval: CandleInterval,
+    exchangeName: string,
+    timestamp: number
+  ): string {
+    return `${exchangeName}:${symbol}:${interval}:${timestamp}`;
+  }
+
+  // Read: returns the UUID string, or null on cache miss
+  public async getCandleId(
+    symbol: string,
+    interval: CandleInterval,
+    exchangeName: string,
+    timestamp: number
+  ): Promise<string | null> {
+    const key = this._cacheKey(symbol, interval, exchangeName, timestamp);
+    const id = <string>await super.get(key);
+    return id ?? null;
+  }
+
+  // Write: caches the UUID from a freshly upserted row
+  public async setCandleId(row: ICandleRow): Promise<string> {
+    const key = this._cacheKey(row.symbol, row.interval, row.exchangeName, row.timestamp);
+    await super.set(key, row.id);
+    return row.id;
+  }
+}
+```
+
+The resulting Redis key looks like:
+
+```
+candle_cache:binance:BTCUSDT:1h:1715000000000
+             ───────────────────────────────── context key
+```
+
+And the stored value is a UUID:
+
+```
+"3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+```
+
+---
+
+## Read Path
+
+The lookup pattern used by every repository service follows three distinct code paths depending on cache state:
+
+<Steps>
+  <Step title="Cache hit (steady state)">
+    The service calls `getCandleId(symbol, interval, exchange, timestamp)`. Redis returns the UUID in O(1). The service immediately calls `findByPk(uuid)` on the Sequelize model, which is also O(1) via the primary-key index. No full-table scan occurs at any point.
+
+    ```
+    Redis GET  →  O(1)   →  UUID
+    Postgres findByPk  →  O(1)  →  full row
+    ```
+  </Step>
+  <Step title="Cache miss (cold start or Redis restart)">
+    `getCandleId` returns `null`. The service falls through to a Postgres `SELECT WHERE (exchange, symbol, interval, timestamp)` query, which uses the compound index for an O(log n) lookup. The returned row's UUID is immediately written back to Redis via `setCandleId`, so the next call for the same context key hits the cache.
+
+    ```
+    Redis GET  →  null
+    Postgres SELECT (indexed)  →  row
+    Redis SET  →  backfill cache
+    ```
+  </Step>
+  <Step title="After upsert (write path)">
+    When a new row is inserted or an existing row is updated, the repository uses `INSERT ... ON CONFLICT DO UPDATE ... RETURNING *` to retrieve the final row in a single round-trip. The UUID from the `RETURNING` clause is passed directly to `setCandleId` in the same synchronous code path — before the calling function returns.
+
+    ```
+    Postgres UPSERT RETURNING *  →  row (with UUID)
+    Redis SET  →  cache populated synchronously
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Cache Consistency Guarantee
+
+The design ensures that the cache is **never stale after a write**. Because every upsert populates the cache from the `RETURNING *` row within the same critical section — before any other code can observe the result — there is no window during which a concurrent read could find an outdated UUID in Redis.
+
+Concretely:
+
+1. Upsert executes and returns the committed row (including its `id` field).
+2. `setCandleId(row)` writes `row.id` to Redis.
+3. Only then does the repository function return to its caller.
+
+Any subsequent `getCandleId` call, on any connection, will find the correct UUID in the cache. The pattern eliminates the classic "cache-aside" race condition where a write completes and a concurrent reader refreshes the cache before the writer has had a chance to update it.
+
+---
+
+## No TTL by Default
+
+<Note>
+  All production cache services pass `TTL = -1` when constructing their `BaseMap`. Keys never expire unless the Redis instance is restarted or the application explicitly calls `clear()` on startup (controlled by the `NO_FLUSH` flag).
+
+  If Redis restarts, the cache is cold but the application degrades gracefully: every lookup falls through to Postgres and automatically re-populates the cache. There is no data loss and no manual intervention required. Within a few minutes of normal operation, the hot key set is fully cached again.
+</Note>
+
+---
+
+## Redis Connection Configuration
+
+The connection is created once per process via the `singleshot` helper in `src/config/redis.ts`, which wraps `ioredis`. A `setInterval` ping fires every **30 seconds** to keep the TCP connection alive through NAT and firewall idle timeouts.
+
+```typescript
+// src/config/redis.ts (simplified)
+export const getRedis = singleshot(() => {
+  const redis = new Redis({
+    host: CC_REDIS_HOST,
+    port: CC_REDIS_PORT,
+    username: CC_REDIS_USER,
+    password: CC_REDIS_PASSWORD,
+  });
+
+  // 30-second keepalive ping
+  setInterval(async () => {
+    await redis.ping();
+  }, 30000);
+
+  return redis;
+});
+```
+
+Environment variables that control this connection:
+
+| Variable | Default | Description |
+|---|---|---|
+| `CC_REDIS_HOST` | `127.0.0.1` | Redis server hostname or IP. Use `host.docker.internal` inside Docker. |
+| `CC_REDIS_PORT` | `6379` | Redis TCP port. |
+| `CC_REDIS_USER` | `default` | Redis ACL username. The bundled compose uses the built-in `default` user. |
+| `CC_REDIS_PASSWORD` | `mysecurepassword` | Redis password. Must match the `--requirepass` value in the compose file. |
