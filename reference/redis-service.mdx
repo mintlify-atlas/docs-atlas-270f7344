@@ -91,7 +91,7 @@ export const getRedis = singleshot(() => {
 
   setInterval(async () => {
     await redis.ping();
-  }, 30_000);
+  }, 30000);
 
   process.on("SIGINT", async () => {
     await redis.disconnect(false);
@@ -160,7 +160,7 @@ A `setInterval` inside `getRedis()` issues a `PING` command every 30 seconds. Th
 ```typescript
 setInterval(async () => {
   await redis.ping();
-}, 30_000);
+}, 30000);
 ```
 
 <Tip>

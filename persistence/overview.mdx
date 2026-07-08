@@ -1,7 +1,7 @@
 ---
 title: "Persistence Layer Overview: Adapters, DB, and Cache"
 sidebarTitle: "Overview"
-description: "How the 16 backtest-kit persist adapters connect to PostgreSQL via TypeORM and Redis via BaseMap, replacing file-based storage with production-grade persistence."
+description: "How the 16 backtest-kit persist adapters wire PostgreSQL via TypeORM and Redis via BaseMap, replacing file-based storage with production-grade persistence."
 ---
 
 The persistence layer in `backtest-kit-redis-postgres-pgpool-docker` is organized into three cooperating tiers: the **adapter registration layer** (`src/config/setup.ts`) wires the 16 `IPersist*Instance` implementations that backtest-kit calls; the **DB tier** (`src/lib/services/db/`) contains TypeORM services that execute atomic `INSERT … ON CONFLICT … DO UPDATE … RETURNING` statements against PostgreSQL; and the **cache tier** (`src/lib/services/cache/`) contains Redis `BaseMap` services that store each row's UUID for O(1) lookups. Strategy code, runners, and the CLI entrypoint remain entirely unchanged — only the persistence layer is swapped.

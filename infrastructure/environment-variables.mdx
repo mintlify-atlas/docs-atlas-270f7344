@@ -1,7 +1,7 @@
 ---
-title: "Environment Variables Reference for backtest-kit Docker Stack"
+title: "Environment Variables for backtest-kit Docker Stack"
 sidebarTitle: "Env Variables"
-description: "Complete reference for all environment variables consumed by the app and Docker containers, including Postgres connection string, Redis credentials, and execution mode flags."
+description: "Complete reference for all CC_* app variables and Docker CLI flags, with defaults, Postgres connection string, and Redis credentials."
 ---
 
 Environment variables configure both the Node.js application and the Docker containers that support it. Variables prefixed `CC_` are read directly by the TypeScript source at startup (via `src/config/params.ts`). Variables without that prefix are consumed by the backtest-kit CLI runner or forwarded to the running strategy via the `environment` section of the root `docker-compose.yaml`. All application variables have sensible defaults that match the dev compose files, so the stack works out of the box with zero configuration.

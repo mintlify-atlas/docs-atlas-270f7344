@@ -1,7 +1,7 @@
 ---
 title: "backtest-kit Persistence: PostgreSQL, Redis, and Pgpool-II"
 sidebarTitle: "Introduction"
-description: "Learn how backtest-kit-redis-postgres-pgpool-docker replaces file-based storage with PostgreSQL, Redis, and a Pgpool-II replica cluster for production trading."
+description: "Learn how backtest-kit-redis-postgres-pgpool-docker replaces file-based storage with PostgreSQL, Redis, and a Pgpool-II replica cluster for trading."
 ---
 
 `backtest-kit-redis-postgres-pgpool-docker` is a production-grade integration that replaces the default `./dump/` file-based persistence in [backtest-kit](https://github.com/tripolskypetr/backtest-kit) with **PostgreSQL** as the authoritative source of truth and **Redis** as an O(1) lookup cache, all packaged with Docker Compose for one-command deploys. The project ships **16 custom persist adapters** that implement the full `IPersist*Instance` contract on top of PostgreSQL (via TypeORM) and Redis (via ioredis). Strategy code, runners, and the CLI entrypoint remain entirely unchanged — only the persistence layer is swapped.
@@ -62,9 +62,9 @@ Adapters marked **soft-delete** (Measure, Interval, Memory) never physically rem
 
 The persistence layer is mode-agnostic. The same 16 adapters serve all three `backtest-kit` execution modes:
 
-- **Backtest** — replays historical candle data against the strategy. The `backtest` column on relevant tables namespaces records so backtest runs do not pollute live data.
-- **Live** — connects to a live exchange feed; all adapter writes land in the production tables.
-- **Paper** — live market data, simulated order execution; identical persistence path to live mode.
+- [**Backtest**](/modes/backtest) — replays historical candle data against the strategy. The `backtest` column on relevant tables namespaces records so backtest runs do not pollute live data.
+- [**Live**](/modes/live) — connects to a live exchange feed; all adapter writes land in the production tables.
+- [**Paper**](/modes/paper) — live market data, simulated order execution; identical persistence path to live mode.
 
 Detailed setup instructions for each mode are covered in the [Quickstart](/quickstart) guide.
 

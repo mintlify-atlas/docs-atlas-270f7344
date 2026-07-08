@@ -1,5 +1,5 @@
 ---
-title: "Redis Cache Services: O(1) ID Lookup via BaseMap"
+title: "Redis Cache Services: Key-Scoped ID Lookup via BaseMap"
 sidebarTitle: "Cache Services"
 description: "API reference for all 16 Redis cache services, the BaseMap abstraction they extend, and the key structure each service uses to namespace Redis entries."
 ---
@@ -87,15 +87,15 @@ The table below lists each cache service's `REDIS_KEY` prefix, the composite key
 | `RiskCacheService` | `risk_cache` | `{exchangeName}:{riskName}` | `hasRiskId`, `getRiskId`, `setRiskId` |
 | `PartialCacheService` | `partial_cache` | `{exchangeName}:{strategyName}:{symbol}:{signalId}` | `hasPartialId`, `getPartialId`, `setPartialId` |
 | `BreakevenCacheService` | `breakeven_cache` | `{exchangeName}:{strategyName}:{symbol}:{signalId}` | `hasBreakevenId`, `getBreakevenId`, `setBreakevenId` |
-| `StorageCacheService` | `storage_cache` | `{backtest}:{signalId}` | `hasStorageId`, `getStorageId`, `setStorageId` |
-| `NotificationCacheService` | `notification_cache` | `{backtest}:{notificationId}` | `hasNotificationId`, `getNotificationId`, `setNotificationId` |
+| `StorageCacheService` | `storage_cache` | `"backtest"\|"live":{signalId}` | `hasStorageId`, `getStorageId`, `setStorageId` |
+| `NotificationCacheService` | `notification_cache` | `"backtest"\|"live":{notificationId}` | `hasNotificationId`, `getNotificationId`, `setNotificationId` |
 | `LogCacheService` | `log_cache` | `{entryId}` | `hasLogId`, `getLogId`, `setLogId` |
 | `MeasureCacheService` | `measure_cache` | `{bucket}:{entryKey}` | `hasMeasureId`, `getMeasureId`, `setMeasureId` |
 | `IntervalCacheService` | `interval_cache` | `{bucket}:{entryKey}` | `hasIntervalId`, `getIntervalId`, `setIntervalId`, `deleteIntervalId` |
 | `MemoryCacheService` | `memory_cache` | `{signalId}:{bucketName}:{memoryId}` | `hasMemoryEntryId`, `getMemoryEntryId`, `setMemoryEntryId` |
-| `RecentCacheService` | `recent_cache` | `{exchangeName}:{strategyName}:{symbol}:{frameName}:{backtest}` | `hasRecentId`, `getRecentId`, `setRecentId` |
+| `RecentCacheService` | `recent_cache` | `"backtest"\|"live":{exchangeName}:{strategyName}:{frameName}:{symbol}` | `hasRecentId`, `getRecentId`, `setRecentId` |
 | `StateCacheService` | `state_cache` | `{signalId}:{bucketName}` | `hasStateId`, `getStateId`, `setStateId` |
-| `SessionCacheService` | `session_cache` | `{strategyName}:{exchangeName}:{frameName}:{symbol}:{backtest}` | `hasSessionId`, `getSessionId`, `setSessionId` |
+| `SessionCacheService` | `session_cache` | `{exchangeName}:{strategyName}:{frameName}:{symbol}:"backtest"\|"live"` | `hasSessionId`, `getSessionId`, `setSessionId` |
 
 ---
 

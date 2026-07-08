@@ -1,7 +1,7 @@
 ---
-title: "Atomic Upserts: ON CONFLICT DO UPDATE RETURNING"
+title: "Atomic Upserts: INSERT ON CONFLICT DO UPDATE RETURNING"
 sidebarTitle: "Atomicity"
-description: "How single-statement INSERT … ON CONFLICT … DO UPDATE … RETURNING eliminates read-then-write race conditions and replica-lag violations in the backtest-kit persistence layer."
+description: "Atomic INSERT … ON CONFLICT … DO UPDATE … RETURNING removes read-then-write races and replica-lag violations in the backtest-kit persistence layer."
 ---
 
 backtest-kit's write durability contract is strict: after `writeXData(...)` returns, the very next `readXData(...)` must see the just-written value. The default file-based persistence satisfies this trivially — `fs.writeFile` followed by `fs.readFile` on the same node is effectively serialized. A naïve SQL implementation that does a `SELECT` to check existence, then either `INSERT` or `UPDATE`, does **not** satisfy this contract under concurrent access or on a replica cluster with asynchronous streaming replication.

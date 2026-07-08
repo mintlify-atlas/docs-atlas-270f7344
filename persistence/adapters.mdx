@@ -1,7 +1,7 @@
 ---
 title: "16 Persist Adapters: backtest-kit Contract on PostgreSQL"
 sidebarTitle: "Adapters"
-description: "Detailed reference for all 16 persist adapters, their backtest-kit interface, table names, unique indexes, and payload types."
+description: "Detailed reference for all 16 persist adapters: backtest-kit interface, PostgreSQL table names, unique index columns, and payload types."
 ---
 
 Each of the 16 adapters in `src/config/setup.ts` implements a corresponding `IPersist*Instance` interface from the `backtest-kit` package. An adapter is a plain class with constructor fields that form the context key, a `waitForInit` gate, and one or more `read*` / `write*` methods that delegate directly to the corresponding `*DbService` and `*CacheService` in the IoC container. The strategy code, runners, and CLI entrypoint never touch the persistence layer directly — they only call backtest-kit's high-level API, which routes through whichever adapter implementation has been registered.

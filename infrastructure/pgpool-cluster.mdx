@@ -1,7 +1,7 @@
 ---
-title: "Pgpool-II Replica Cluster: Setup and Architecture"
+title: "Pgpool-II Replica Cluster: Setup, Architecture, and Usage"
 sidebarTitle: "Pgpool Cluster"
-description: "How the bundled Pgpool-II Docker image runs 1 primary + 2 streaming replicas behind a single :5432 endpoint, and why it matters for write durability testing."
+description: "How the bundled Pgpool-II image runs 1 primary + 2 streaming replicas behind a single :5432 endpoint, and why it matters for durability testing."
 ---
 
 The `docker/pgpool/docker-compose.yaml` starts a complete PostgreSQL 16 streaming-replication cluster — one primary node and two asynchronous replicas — all behind a Pgpool-II load balancer. The entire topology runs inside the single `tripolskypetr/pgpool:latest` container, making it practical to run a production-representative database setup on a development laptop without any external orchestration. The application connects to `:5432` as if it were a plain Postgres endpoint; Pgpool transparently routes writes to the primary and distributes reads across the replicas.
